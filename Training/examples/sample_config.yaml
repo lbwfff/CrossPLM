@@ -1,0 +1,38 @@
+# 任务名称（仅用于标识）
+task_name: my_plm_task
+# 保存模型时的名字
+model_name: esm2_t6_8M
+# HuggingFace 上的 backbone 模型 ID
+backbone_model_id: facebook/esm2_t6_8M_UR50D
+# 训练数据 CSV 文件路径（必填）
+csv_data_path: ./examples/sample.csv
+# CSV 中序列列的列名
+sequence_column: sequence
+# CSV 中标签列的列名（每个字符对应一个氨基酸的标签）
+label_column: label
+# 训练集划分比例，剩余为验证集
+train_ratio: 0.9
+# 任务类型: token_classification | mlm
+task_type: token_classification
+# 序列最大长度（超过截断）
+max_seq_length: 512
+# 仅在 task_type=mlm 时生效，掩码比例
+mlm_probability: 0.15
+# 单设备训练 batch size
+per_device_train_batch_size: 2
+# 单设备评估 batch size
+per_device_eval_batch_size: 2
+# 学习率
+learning_rate: 2e-5
+# 训练轮数
+num_train_epochs: 1
+# 最大训练步数（-1 表示由 epoch 决定）
+max_steps: -1
+# 每多少步打印一次日志
+logging_steps: 1
+# 每多少步做一次评估
+eval_steps: 5
+# 每多少步保存一次 checkpoint
+save_steps: 10
+# 随机种子
+seed: 42
