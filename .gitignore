@@ -24,9 +24,18 @@ Training/outputs/
 Training/examples/relaxdb_processed.csv
 Training/examples/mbmrb_processed.csv
 
-# Model weights
+# Model weights (all formats)
 *.safetensors
 *.bin
 *.pt
 checkpoints/
 eval_results/
+
+# SAE module artifacts
+Single/__pycache__/
+Single/*.egg-info/
+Single/single/__pycache__/
+Single/single/**/__pycache__/
+
+# All SAE outputs (embeddings, models, analysis results)
+Outputs/
