@@ -18,11 +18,15 @@ env/
 *.swo
 
 # Training artifacts
-Training/tasks/
+Training/outputs/
+
+# Preprocessed data (can be regenerated from Dataset/ raw files)
 Training/examples/relaxdb_processed.csv
+Training/examples/mbmrb_processed.csv
 
 # Model weights
 *.safetensors
 *.bin
 *.pt
 checkpoints/
+eval_results/

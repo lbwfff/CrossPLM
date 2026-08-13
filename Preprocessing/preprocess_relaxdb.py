@@ -81,9 +81,10 @@ def process_relaxdb(input_path: str, output_path: str):
 def main():
     parser = argparse.ArgumentParser(description="Preprocess RelaxDB CSV for PLM training")
     parser.add_argument("--input", type=str,
-                        default=os.path.join(os.path.dirname(__file__), "..", "..", "Dataset", "relaxdb_data.csv"),
+                        default=os.path.join(os.path.dirname(__file__), "..", "Dataset", "relaxdb_data.csv"),
                         help="Path to relaxdb_data.csv")
-    parser.add_argument("--output", type=str, default="./examples/relaxdb_processed.csv",
+    parser.add_argument("--output", type=str,
+                        default=os.path.join("..", "Training", "examples", "relaxdb_processed.csv"),
                         help="Output CSV path")
     args = parser.parse_args()
 

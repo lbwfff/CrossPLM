@@ -222,7 +222,7 @@ class Trainer:
         if f1 <= self.best_f1 and len(self.best_checkpoints) >= self.top_k:
             return
 
-        tag = f"epoch_{epoch:.2f}_f1_{f1:.4f}"
+        tag = f"epoch_{epoch:.2f}_f1_{int(f1 * 10000):04d}"
         self._save_checkpoint(tag, f1, epoch)
 
         self.best_checkpoints.append((f1, step, tag))
@@ -276,7 +276,7 @@ class Trainer:
         plt.plot(epochs, f1_scores, marker="o", linestyle="-", linewidth=2, markersize=4)
         plt.xlabel("Epoch", fontsize=14)
         plt.ylabel("F1-score (macro)", fontsize=14)
-        plt.title(f"Training Curve — {self.config.model_name}", fontsize=15)
+        plt.title(f"Training Curve — {self.config.backbone_model_id}", fontsize=15)
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
 

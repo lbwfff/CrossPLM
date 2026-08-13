@@ -69,62 +69,62 @@ class TrainingConfig:
         template = """# ============================================================
 # CrossPLM Training Config Template
 # ============================================================
-# 请根据实际需求修改此文件，然后运行:
-#   python launch.py --config <此文件路径>
+# Edit this file, then run:
+#   python crossplm.py train --config <path>
 # ============================================================
 
-# 任务名称（仅用于标识）
+# Task name (for identification only)
 task_name: my_plm_task
 
-# 保存模型时的名字
+# Name used when saving the model
 model_name: esm2_t6_8M
 
-# HuggingFace 上的 backbone 模型 ID
+# HuggingFace backbone model ID
 backbone_model_id: facebook/esm2_t6_8M_UR50D
 
-# 训练数据 CSV 文件路径（必填，支持相对路径或绝对路径）
+# Path to training CSV (required, relative or absolute)
 csv_data_path: ./examples/sample.csv
 
-# CSV 中序列列的列名
+# Column name for sequences in the CSV
 sequence_column: sequence
 
-# CSV 中标签列的列名（每个字符对应一个氨基酸位置的标签）
+# Column name for per-residue labels in the CSV
 label_column: label
 
-# 训练集划分比例（0~1），剩余为验证集
+# Train/eval split ratio (0~1), the rest is used for eval
 train_ratio: 0.9
 
-# 任务类型: token_classification | mlm
+# Task type: token_classification | mlm
 task_type: token_classification
 
-# 序列最大长度，超过则截断
+# Max sequence length; longer sequences are truncated
 max_seq_length: 512
 
-# 仅在 task_type=mlm 时生效，掩码比例
+# Only used when task_type=mlm, mask probability
 mlm_probability: 0.15
 
-# ----- 训练超参数 -----
+# ----- Training hyperparameters -----
 per_device_train_batch_size: 8
 per_device_eval_batch_size: 8
 gradient_accumulation_steps: 1
 learning_rate: 2.0e-5
 weight_decay: 0.01
 num_train_epochs: 3
-max_steps: -1           # -1 表示由 num_train_epochs 决定
+max_steps: -1           # -1 means determined by num_train_epochs
 
-# ----- 日志与保存 -----
+# ----- Logging & saving -----
 logging_steps: 10
 eval_steps: 500
 save_steps: 1000
 save_total_limit: 3
 
-# ----- 类别权重（缓解不平衡） -----
-#   none     = 不加权
-#   inverse  = 逆频率归一化（推荐）
-#   log      = 对数缩放（更温和）
+# ----- Class weights (address imbalance) -----
+#   none     = no weighting
+#   inverse  = inverse frequency normalization (recommended)
+#   log      = log scaling (gentler)
 class_weight_method: inverse
 
-# ----- 其他 -----
+# ----- Other -----
 seed: 42
 dataloader_num_workers: 2
 fp16: false
