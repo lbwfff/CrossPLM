@@ -117,7 +117,11 @@ class FineTunedESMEmbedder:
         labels: List[str],
         layer: Optional[int] = None,
         batch_size: int = 8,
+        label_map: Optional[dict] = None,
     ) -> Dict[str, torch.Tensor]:
+        if label_map is None:
+            from single.label_maps import get_label_map
+            label_map = get_label_map("mBMRB")
         if layer is None:
             layer = self.num_layers
 
@@ -154,9 +158,9 @@ class FineTunedESMEmbedder:
                 label_chars = list(label_str_clean[:seq_len])
                 if len(label_chars) < seq_len:
                     label_chars += ["_"] * (seq_len - len(label_chars))
-                MBM_LABEL = {"A": 0, ".": 1, "0": 0, "1": 1}
+                from single.label_maps import encode_label_string
                 label_ids = torch.tensor(
-                    [MBM_LABEL.get(c, -100) for c in label_chars],
+                    encode_label_string("".join(label_chars), label_map),
                     dtype=torch.long,
                 )
                 all_label_ids.append(label_ids)

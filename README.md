@@ -21,19 +21,19 @@ CrossPLM/
 │   ├── crossplm/                # Python package
 │   ├── outputs/                 # Training outputs (checkpoints, logs)
 │   └── examples/                # Sample data and configs
-├── Single/                      # ★ NEW: SAE-based interpretability
+├── Single/                      # ★ SAE-based interpretability
 │   ├── setup.py
 │   └── single/
 │       ├── configs.py           # Configuration dataclasses
+│       ├── label_maps.py        # Configurable label encoding for datasets
+│       ├── paths.py             # Centralized experiment output paths
 │       ├── embedders/           # Hidden state extraction from fine-tuned PLMs
 │       ├── sae/                 # SAE architectures (ReLUSAE, TopKSAE)
 │       ├── train/               # SAE training loop
-│       ├── analysis/            # Feature-to-label alignment
+│       ├── analysis/            # Feature-to-label & feature-to-concept alignment
 │       └── scripts/             # CLI scripts
-├── Outputs/                     # All SAE outputs (auto-organized)
-│   ├── embeddings/              # Extracted PLM hidden states
-│   ├── sae/                     # Trained SAE models
-│   └── analysis/               # Feature analysis results
+├── Outputs/                     # Per-experiment output trees
+│   └── <experiment>_<ts>/       # embeddings / sae / concepts / analysis
 └── README.md
 ```
 
@@ -106,32 +106,53 @@ Each feature can then be interpreted by checking **when** it activates:
 
 ### Usage
 
+All outputs are organized under a single **experiment directory**. Pick an
+experiment name (or reuse one with `--exp_dir`) and every step routes its
+output into the same tree:
+
+```
+Outputs/<experiment>_<timestamp>/
+    embeddings/layer_<N>/shard_<i>/activations.pt
+    sae/ae.pt
+    concepts/shard_<i>/aa_concepts.npz
+    analysis/*.csv|*.json|visualizations/
+```
+
 ```bash
 cd Single
 
-# 1. Extract hidden states from fine-tuned model
+# 1. Extract hidden states from fine-tuned model (creates Outputs/mb_<ts>/)
 python -m single.scripts.extract_embeddings \
     --ckpt_path ../Training/outputs/tasks/my_task/checkpoints/best \
     --sequences_csv ../Dataset/mBMRB.csv \
-    --label_column label
+    --experiment mb \
+    --label_column label --label_map mBMRB
 
 # 2. Train SAE (320-dim → 640 sparse features)
 python -m single.scripts.train_sae \
-    --embeddings_dir ../Outputs/embeddings/esm2_8m/layer_6/shard_0 \
+    --embeddings_dir ../Outputs/mb_*/embeddings/layer_6/shard_0 \
+    --experiment mb \
     --batch_size 64 --dict_size 640 --steps 10000 --l1_penalty 0.03
 
 # 3. Align features with task labels
 python -m single.scripts.analyze_features \
-    --sae_dir ../Outputs/sae/esm2_8m_l6_d640_<ts> \
-    --embeddings_dir ../Outputs/embeddings/esm2_8m/layer_6 \
-    --sequences_csv ../Dataset/mBMRB.csv --label_column label
+    --sae_dir ../Outputs/mb_*/sae \
+    --embeddings_dir ../Outputs/mb_*/embeddings/layer_6 \
+    --experiment mb \
+    --sequences_csv ../Dataset/mBMRB.csv --label_column label --label_map mBMRB
 
 # 4. Visualize top features on sequences
 python -m single.scripts.visualize_features \
-    --sae_dir ../Outputs/sae/esm2_8m_l6_d640_<ts> \
-    --embeddings_path ../Outputs/embeddings/esm2_8m/layer_6/shard_0/activations.pt \
-    --output_dir ../Outputs/analysis/vis --feature_indices 234 426
+    --sae_dir ../Outputs/mb_*/sae \
+    --embeddings_path ../Outputs/mb_*/embeddings/layer_6/shard_0/activations.pt \
+    --experiment mb --feature_indices 234 426 --label_map mBMRB
 ```
+
+Note: `--experiment <name>` creates a fresh `Outputs/<name>_<ts>/` on first use.
+To continue the same run, pass `--exp_dir <existing_dir>` instead (or reuse the
+same `--experiment` name, which reuses the dir if the name already carries a
+timestamp). Any `--output_dir`/`--save_dir`/`--concepts_dir` explicitly given
+overrides the experiment routing.
 
 ### Example Output
 
@@ -153,7 +174,107 @@ High-precision "flexible residue detectors":
 | **Recall** | What fraction of positive cases does this feature catch? |
 | **F1** | Harmonic mean of precision and recall |
 | **AUROC** | Overall discriminative power (0.5=random, 1.0=perfect) |
-| **Activation Gap** | Mean(flexible activation) − Mean(rigid activation) |
+| **Activation Gap** | Mean(positive activation) − Mean(negative activation) |
+
+### Configurable Label Maps
+
+The pipeline is **not hardcoded to mBMRB**. Label encoding, the positive class, and
+class names are configurable via `--label_map` on every script. This lets you analyze
+datasets with different label formats without changing any code.
+
+**Built-in presets** (defined in `single/label_maps.py`):
+
+| Preset | Positive class | Class names | Character mapping |
+|--------|---------------|-------------|-------------------|
+| `mBMRB` | 1 | rigid / flexible | `A→0`, `.→1`, `0→0`, `1→1` |
+| `relaxdb` | 1 | static / mobile | `p/A/v→0`, `./b/^→1` |
+| `ss3` | 1 | helix / strand / coil | `H→0`, `E→1`, `C→2` (3-class) |
+
+Use a preset by name:
+```bash
+python -m single.scripts.analyze_features \
+    --sae_dir ... --sequences_csv ... --label_column label --label_map relaxdb
+```
+
+Or provide your own YAML file for custom datasets:
+```yaml
+# my_dataset.yaml
+positive_class: 1
+class_names:
+  0: rigid
+  1: flexible
+mapping:
+  A: 0
+  ".": 1
+  "0": 0
+  "1": 1
+ignore: "_"
+```
+```bash
+python -m single.scripts.analyze_features \
+    --sae_dir ... --sequences_csv ... --label_column label --label_map my_dataset.yaml
+```
+
+Any character not in `mapping` becomes `-100` (ignored in analysis), following the
+HuggingFace ignore-index convention. Add new presets to `LABEL_MAPS` in
+`single/label_maps.py` to reuse them across runs.
+
+### Biological Concept Analysis (Swiss-Prot / UniProtKB)
+
+Beyond task labels, you can align SAE features against **biological concepts** from
+Swiss-Prot — e.g. "Helix", "Domain_kinase", "Binding_site_ATP", "Active site" —
+to discover what real biology each feature encodes. This is a two-step pipeline
+(`single/scripts/analyze_concepts.py`).
+
+**Step 1: Build per-residue concept matrices from a UniProtKB TSV export.**
+
+The TSV must contain the `Entry` and `Sequence` columns plus Feature-table columns
+(`Helix`, `Beta strand`, `Turn`, `Domain [FT]`, `Active site`, `Binding site`, etc.).
+Download from UniProt with a query like: `reviewed:true` → Export → TSV.
+
+```bash
+python -m single.scripts.analyze_concepts build \
+    --annotations_tsv ../Dataset/uniprotkb_swissprot.tsv \
+    --experiment sp \
+    --n_shards 5
+```
+
+This expands each protein-level annotation to amino-acid level and saves
+`shard_N/aa_concepts.npz` (sparse matrices) + `aa_concepts_columns.txt` (concept names)
+into `Outputs/sp_*/concepts/`.
+
+**Step 2: Align SAE features to concepts.**
+
+```bash
+python -m single.scripts.analyze_concepts align \
+    --sae_dir ../Outputs/sp_*/sae \
+    --embeddings_dir ../Outputs/sp_*/embeddings/layer_6 \
+    --experiment sp \
+    --threshold_percents 0 0.15 0.5 0.6 0.8
+```
+
+Concepts and output are routed into `Outputs/sp_*/` automatically. Note that the
+**embeddings must be extracted from the same TSV** (same `--n_shards`) so embedding
+and concept shards are token-aligned.
+
+For every feature × concept pair, computes F1 / precision / recall / AUROC / domain-F1
+across activation thresholds and saves:
+
+- `feature_concept_pairs.csv` — ALL pairs (filter with pandas, e.g. by AUROC)
+- `feature_concept_metrics.json` — full per-pair metrics
+
+**Example output:**
+
+```
+Top feature-concept associations (by F1):
+  Feature #42  → Domain_kinase                  F1=0.623 AUROC=0.781 P=0.710 R=0.551
+  Feature #107 → Helix                          F1=0.588 AUROC=0.742 P=0.650 R=0.537
+  Feature #3   → Binding_site_ATP               F1=0.411 AUROC=0.694 P=0.502 R=0.348
+```
+
+Note: to get exact per-protein alignment between embeddings and concept matrices,
+extract embeddings from the **same TSV** with `extract_embeddings.py` (per-shard order
+must match). If shard counts differ, the script falls back to best-effort splitting.
 
 ---
 
@@ -175,9 +296,12 @@ High-precision "flexible residue detectors":
 | Feature | Description |
 |---------|-------------|
 | **Fine-tuned PLM support** | Extracts hidden states from any fine-tuned `AutoModelForTokenClassification` |
+| **Configurable labels** | `--label_map` presets or YAML files for any dataset format |
 | **ReLU / TopK SAE** | Two standard SAE architectures |
 | **L1 sparsity + dead neuron resampling** | Standard training recipe from mechanistic interpretability |
 | **Feature-label alignment** | F1, AUROC, correlation, activation gap per feature |
+| **Feature-concept alignment** | F1/AUROC per feature vs Swiss-Prot biological concepts (multi-label) |
+| **UniProt annotation parsing** | TSV Feature-table annotations → per-residue sparse concept matrices |
 | **Per-protein tracking** | Find which proteins maximally activate each feature |
 | **Visualization** | Feature activation vs ground truth on sequences |
 | **Normalization** | Feature-wise max-activation normalization for meaningful comparisons |
@@ -217,23 +341,32 @@ cd Single && pip install -e .
 
 ## Output Structure
 
-All SAE outputs are auto-organized under `Outputs/`:
+Every step of the pipeline writes into one **experiment directory** (created on
+first use via `--experiment <name>`; reuse with `--exp_dir`):
 
 ```
 Outputs/
-├── embeddings/
-│   └── esm2_8m/layer_6/           # Per-residue hidden states
-│       ├── shard_0/activations.pt
-│       ├── shard_1/activations.pt
-│       └── ...
-├── sae/
-│   └── esm2_8m_l6_d640_<ts>/      # Trained SAE (timestamped)
-│       ├── ae.pt                   # Model weights
-│       └── checkpoint_2500/
-└── analysis/
-    └── <ts>/                       # Analysis results (timestamped)
-        ├── feature_label_metrics.json
+└── <experiment>_<timestamp>/
+    ├── embeddings/
+    │   └── layer_<N>/                # Per-residue hidden states
+    │       ├── shard_0/activations.pt
+    │       ├── shard_1/activations.pt
+    │       └── ...
+    ├── sae/
+    │   ├── ae.pt                      # SAE weights
+    │   └── checkpoint_<step>/
+    ├── concepts/
+    │   ├── shard_<i>/aa_concepts.npz # Per-residue concept matrices
+    │   └── aa_concepts_columns.txt
+    └── analysis/
+        ├── feature_concept_pairs.csv  # Feature × concept alignment (all pairs)
+        ├── feature_concept_metrics.json
+        ├── feature_label_metrics.json # Task-label alignment
         ├── feature_label_correlations.npy
         ├── activation_profile.npz
-        └── visualizations/
+        └── visualizations/            # PNG plots
 ```
+
+`single/paths.py` centralizes these paths; scripts resolve subdirectories from the
+experiment dir automatically. Explicit `--output_dir` / `--save_dir` /
+`--concepts_dir` flags override the routing when you need custom locations.

@@ -55,7 +55,12 @@ def plot_feature_label_overlap(
     sequence: str,
     feature_idx: int,
     save_path: Optional[Path] = None,
+    label_names: Optional[dict] = None,
 ):
+    label_names = label_names or {0: "Negative", 1: "Positive"}
+
+    def color_for(label):
+        return {1: "#ff6b6b", 0: "#4ecdc4"}.get(label, "#cccccc")
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 5), sharex=True)
 
     with torch.no_grad():
@@ -69,19 +74,24 @@ def plot_feature_label_overlap(
     ax1.set_ylabel("Feature Activation")
     ax1.set_title(f"Feature #{feature_idx} Activation")
 
-    colors = ["white" if l == -100 else ("#ff6b6b" if l == 1 else "#4ecdc4") for l in labels[:n].tolist()]
+    colors = [
+        "white" if l == -100 else (color_for(l))
+        for l in labels[:n].tolist()
+    ]
     ax2.bar(positions, np.ones(n), color=colors, edgecolor="gray", linewidth=0.5, width=0.8)
     ax2.set_ylabel("Ground Truth")
     ax2.set_xlabel("Residue Position")
     ax2.set_yticks([])
 
-    red_patch = mpatches.Patch(color="#ff6b6b", label="Flexible (1)")
-    green_patch = mpatches.Patch(color="#4ecdc4", label="Rigid (0)")
+    red_patch = mpatches.Patch(color=color_for(1), label=f"{label_names.get(1, 'Positive')} (1)")
+    green_patch = mpatches.Patch(color=color_for(0), label=f"{label_names.get(0, 'Negative')} (0)")
     ax2.legend(handles=[red_patch, green_patch], loc="upper right")
 
-    if len(sequence) <= 60:
+    if len(sequence) <= 60 and n <= 60:
         ax2.set_xticks(positions)
         ax2.set_xticklabels(list(sequence[:n]), fontsize=8, rotation=90)
+    else:
+        ax2.set_xlim(-0.5, n - 0.5)
 
     plt.tight_layout()
     if save_path:
@@ -118,15 +128,30 @@ def plot_feature_summary(
 def visualize_features(
     sae_dir: Path,
     embeddings_path: Path,
-    output_dir: Path,
+    output_dir: Optional[Path] = None,
+    experiment: Optional[str] = None,
+    exp_dir: Optional[Path] = None,
     sequences_csv: Optional[Path] = None,
     sequence_column: str = "sequence",
     label_column: Optional[str] = None,
     feature_indices: Optional[List[int]] = None,
     n_features: int = 10,
+    max_proteins: int = 3,
+    label_map: str = "mBMRB",
 ):
+    from single.paths import resolve_experiment
+
+    # Prefer explicit output_dir (legacy); else route into the experiment dir.
+    if output_dir is None:
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        output_dir = exp.visualizations_dir()
+        print(f"Experiment dir: {exp.dir}")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    from single.label_maps import get_label_map
+    label_map_spec = get_label_map(label_map)
+    label_names = label_map_spec["class_names"]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -142,32 +167,57 @@ def visualize_features(
         embeddings = data.to(device)
         labels = None
 
+    # Build boundaries from CSV: each sequence's token range in the concatenated tensor
+    boundaries = []
     if sequences_csv:
         import pandas as pd
-        df = pd.read_csv(sequences_csv)
+        with open(sequences_csv, "r") as _f:
+            _first = _f.readline()
+        _sep = "\t" if _first.count("\t") > _first.count(",") else ","
+        df = pd.read_csv(sequences_csv, sep=_sep, low_memory=False)
         sequences = df[sequence_column].tolist()
+        if label_column and label_column in df.columns:
+            df[label_column] = df[label_column].fillna("").astype(str)
+            seq_labels = df[label_column].tolist()
+        else:
+            seq_labels = None
+        start = 0
+        for seq in sequences[:max_proteins]:
+            seq_len = min(len(seq), 510)
+            end = start + seq_len
+            boundaries.append((start, end, seq, seq_labels[len(boundaries)] if seq_labels else None))
+            start = end
     else:
         sequences = ["M" * embeddings.shape[0]]
+        boundaries = [(0, min(200, embeddings.shape[0]), sequences[0], None)]
 
     if feature_indices is None:
         from single.analysis.feature_alignment import align_features_to_labels
         if labels is not None:
-            metrics = align_features_to_labels(sae, embeddings, labels)
+            metrics = align_features_to_labels(
+                sae, embeddings, labels, positive_class=label_map_spec["positive_class"],
+            )
             top = sorted(metrics.items(), key=lambda x: x[1]["best_f1"], reverse=True)
             feature_indices = [int(k) for k, _ in top[:n_features]]
             plot_feature_summary(metrics, output_dir / "feature_summary.png")
         else:
             feature_indices = list(range(min(n_features, sae.dict_size)))
 
-    print(f"Visualizing {len(feature_indices)} features...")
+    print(f"Visualizing {len(feature_indices)} features across {len(boundaries)} proteins...")
     for fidx in feature_indices:
-        save_path = output_dir / f"feature_{fidx}_overlap.png"
-        plot_feature_label_overlap(
-            sae, embeddings, labels if labels is not None else torch.zeros(embeddings.shape[0]),
-                sequences[0] if sequences else "",
-                fidx, save_path=save_path,
+        for prot_idx, (start, end, seq, lbl_str) in enumerate(boundaries):
+            prot_emb = embeddings[start:end]
+            if labels is not None:
+                prot_labels = labels[start:end]
+            else:
+                prot_labels = torch.zeros(end - start, device=device)
+
+            save_path = output_dir / f"feature_{fidx}_protein_{prot_idx}.png"
+            plot_feature_label_overlap(
+                sae, prot_emb, prot_labels, seq, fidx, save_path=save_path,
+                label_names=label_names,
             )
-        print(f"  Feature #{fidx} → {save_path}")
+        print(f"  Feature #{fidx} → {output_dir}/feature_{fidx}_protein_*.png")
 
     print(f"\nVisualizations saved to {output_dir}")
 
@@ -176,11 +226,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize SAE feature activations on proteins")
     parser.add_argument("--sae_dir", type=Path, required=True)
     parser.add_argument("--embeddings_path", type=Path, required=True)
-    parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument("--experiment", type=str, default=None,
+                        help="Experiment name; creates Outputs/<experiment>_<ts>/")
+    parser.add_argument("--exp_dir", type=Path, default=None,
+                        help="Reuse an existing experiment directory")
+    parser.add_argument("--output_dir", type=Path, default=None,
+                        help="Explicit output dir (overrides experiment routing)")
     parser.add_argument("--sequences_csv", type=Path, default=None)
     parser.add_argument("--sequence_column", type=str, default="sequence")
     parser.add_argument("--label_column", type=str, default=None)
     parser.add_argument("--feature_indices", type=int, nargs="+", default=None)
     parser.add_argument("--n_features", type=int, default=10)
+    parser.add_argument("--label_map", type=str, default="mBMRB",
+                        help="Label encoding preset name or path to YAML label-map file")
     args = parser.parse_args()
     visualize_features(**{k: v for k, v in vars(args).items() if v is not None})

@@ -23,7 +23,9 @@ from single.train.training_run import SAETrainingRun
 
 def train_sae(
     embeddings_dir: Path,
-    save_dir: Path,
+    save_dir: Optional[Path] = None,
+    experiment: Optional[str] = None,
+    exp_dir: Optional[Path] = None,
     activation_dim: int = 320,
     dict_size: int = 1280,
     expansion_factor: int = 4,
@@ -37,6 +39,13 @@ def train_sae(
     seed: int = 42,
     resume_from: Optional[Path] = None,
 ):
+    from single.paths import resolve_experiment
+
+    # Prefer explicit save_dir (legacy); else route into the experiment dir.
+    if save_dir is None:
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        save_dir = exp.sae_dir
+        print(f"Experiment dir: {exp.dir}")
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -92,13 +101,14 @@ def train_sae(
 
 
 if __name__ == "__main__":
-    import datetime
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    default_save = Path(f"../Outputs/sae/esm2_8m_l6_d640_{timestamp}")
-
     parser = argparse.ArgumentParser(description="Train SAE on PLM embeddings")
     parser.add_argument("--embeddings_dir", type=Path, required=True)
-    parser.add_argument("--save_dir", type=Path, default=default_save)
+    parser.add_argument("--experiment", type=str, default=None,
+                        help="Experiment name; creates Outputs/<experiment>_<ts>/")
+    parser.add_argument("--exp_dir", type=Path, default=None,
+                        help="Reuse an existing experiment directory")
+    parser.add_argument("--save_dir", type=Path, default=None,
+                        help="Explicit save dir (overrides experiment routing)")
     parser.add_argument("--activation_dim", type=int, default=320)
     parser.add_argument("--dict_size", type=int, default=1280)
     parser.add_argument("--expansion_factor", type=int, default=4)

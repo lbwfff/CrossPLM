@@ -10,6 +10,9 @@ __pycache__/
 .venv/
 venv/
 env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # IDE
 .vscode/
@@ -28,8 +31,15 @@ Training/examples/mbmrb_processed.csv
 *.safetensors
 *.bin
 *.pt
+*.pth
 checkpoints/
 eval_results/
+
+# Downloaded / generated large datasets (keep the small curated CSVs tracked)
+Dataset/proteins.tsv
+Dataset/proteins.tsv.gz
+Dataset/proteins.tsv.gz.done
+Dataset/uniprot/
 
 # SAE module artifacts
 Single/__pycache__/
