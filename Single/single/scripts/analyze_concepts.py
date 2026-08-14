@@ -58,90 +58,60 @@ def cmd_build(
     )
 
 
-def cmd_align(
-    sae_dir: Path,
+def _load_shard_pair(embeddings_dir: Path, concepts_dir: Path, shard_id: int, device: str):
+    """Load (concept_matrix, shard_embeddings) for one shard, aligned by token count."""
+    from single.analysis.concepts import load_concept_shards
+
+    concept_matrix, metadata = load_concept_shards(concepts_dir, shard_id)
+
+    shard_emb_path = Path(embeddings_dir) / f"shard_{shard_id}" / "activations.pt"
+    if not shard_emb_path.exists():
+        cands = sorted(Path(embeddings_dir).glob(f"shard_{shard_id}/**/activations.pt"))
+        if not cands:
+            raise FileNotFoundError(
+                f"No per-shard embeddings found for shard {shard_id} in {embeddings_dir}. "
+                f"Expected {shard_emb_path}. Re-extract embeddings with the same "
+                f"--n_shards used for concept building."
+            )
+        shard_emb_path = cands[0]
+    shard_emb = torch.load(shard_emb_path, map_location="cpu", weights_only=True)
+    if isinstance(shard_emb, dict):
+        shard_emb = shard_emb.get("embeddings", shard_emb)
+    shard_embeddings = shard_emb.to(device)
+
+    if concept_matrix.shape[0] != shard_embeddings.shape[0]:
+        print(f"  ⚠️  Concept matrix ({concept_matrix.shape[0]}) ≠ embeddings "
+              f"({shard_embeddings.shape[0]}). Using min length.")
+        n = min(concept_matrix.shape[0], shard_embeddings.shape[0])
+        concept_matrix = concept_matrix[:n]
+        shard_embeddings = shard_embeddings[:n]
+
+    return concept_matrix, shard_embeddings
+
+
+def _align_shards(
+    sae,
     embeddings_dir: Path,
-    concepts_dir: Optional[Path] = None,
-    output_dir: Optional[Path] = None,
-    experiment: Optional[str] = None,
-    exp_dir: Optional[Path] = None,
-    shard: Optional[int] = None,
-    threshold_min_f1: float = 0.0,
-    n_top_per_concept: int = 20,
-    feature_chunk_size: int = 200,
-    batch_size: int = 1024,
-    compute_auroc: bool = True,
-    compute_domain_f1: bool = True,
-    min_positives: int = 10,
-    threshold_percents: Optional[List[float]] = None,
-):
-    from scipy import sparse
-    from single.analysis.concepts import load_concept_names, load_concept_shards
-    from single.paths import resolve_experiment
-
-    if concepts_dir is None or output_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
-        print(f"Experiment dir: {exp.dir}")
-        if concepts_dir is None:
-            concepts_dir = exp.concepts_dir
-        if output_dir is None:
-            output_dir = exp.analysis_dir
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    print("=" * 60)
-    print("SAE Feature × Concept Alignment")
-    print("=" * 60)
-
-    # Load SAE
-    print("\nLoading SAE...")
-    sae = load_sae(sae_dir, device=device)
-    print(f"  {sae.__class__.__name__}: {sae.dict_size} features, {sae.activation_dim}D")
-
-    # Load concept names
-    concept_names = load_concept_names(concepts_dir)
-    if not concept_names:
-        raise ValueError(f"No concept columns found in {concepts_dir}/aa_concepts_columns.txt")
-
-    # Load embeddings
-    print("\nLoading embeddings...")
+    concepts_dir: Path,
+    concept_names: List[str],
+    shard_ids: List[int],
+    device: str,
+    feature_chunk_size: int,
+    batch_size: int,
+    compute_auroc: bool,
+    compute_domain_f1: bool,
+    min_positives: int,
+    threshold_percents: Optional[List[float]],
+) -> pd.DataFrame:
+    """Run alignment over a set of shards and return all pairs as a DataFrame."""
     all_pairs = []
-    shards_to_process = [shard] if shard is not None else list(range(len(list(Path(concepts_dir).glob("shard_*")))))
-
-    for shard_id in shards_to_process:
+    for shard_id in shard_ids:
         print(f"  Shard {shard_id}...")
-        concept_matrix, metadata = load_concept_shards(concepts_dir, shard_id)
-
-        # Load THIS shard's own embeddings from its shard directory, so token
-        # counts align exactly with the concept matrix (same sharding logic).
-        shard_emb_path = Path(embeddings_dir) / f"shard_{shard_id}" / "activations.pt"
-        if not shard_emb_path.exists():
-            # Fallback: look for per-shard activations.pt anywhere in embeddings_dir
-            cands = sorted(Path(embeddings_dir).glob(f"shard_{shard_id}/**/activations.pt"))
-            if not cands:
-                raise FileNotFoundError(
-                    f"No per-shard embeddings found for shard {shard_id} in {embeddings_dir}. "
-                    f"Expected {shard_emb_path}. Re-extract embeddings with the same "
-                    f"--n_shards used for concept building."
-                )
-            shard_emb_path = cands[0]
-        shard_emb = torch.load(shard_emb_path, map_location="cpu", weights_only=True)
-        if isinstance(shard_emb, dict):
-            shard_emb = shard_emb.get("embeddings", shard_emb)
-        shard_embeddings = shard_emb.to(device)
+        concept_matrix, shard_embeddings = _load_shard_pair(
+            embeddings_dir, concepts_dir, shard_id, device
+        )
         print(f"  Embeddings shard_{shard_id}: {shard_embeddings.shape}")
 
-        if concept_matrix.shape[0] != shard_embeddings.shape[0]:
-            print(f"  ⚠️  Concept matrix ({concept_matrix.shape[0]}) ≠ embeddings "
-                  f"({shard_embeddings.shape[0]}). Using min length.")
-            n = min(concept_matrix.shape[0], shard_embeddings.shape[0])
-            concept_matrix = concept_matrix[:n]
-            shard_embeddings = shard_embeddings[:n]
-
-        # Align
         metrics = align_features_to_concepts(
             sae=sae,
             embeddings=shard_embeddings,
@@ -155,7 +125,6 @@ def cmd_align(
             threshold_percents=threshold_percents,
         )
 
-        # Collect ALL pairs (f1 > 0); threshold_min_f1 only filters console output.
         for fidx, concept_dict in metrics.items():
             for concept, entry in concept_dict.items():
                 row = {
@@ -173,19 +142,76 @@ def cmd_align(
                     row["recall_per_domain"] = entry["recall_per_domain"]
                     row["n_domains"] = entry["n_domains"]
                 all_pairs.append(row)
+    return pd.DataFrame(all_pairs)
 
-    # Save full metrics
-    output_path = output_dir / "feature_concept_metrics.json"
-    with open(output_path, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"\nSaved full metrics to {output_path}")
 
+def _resolve_dirs(concepts_dir, output_dir, experiment, exp_dir):
+    from single.paths import resolve_experiment
+
+    if concepts_dir is None or output_dir is None:
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        print(f"Experiment dir: {exp.dir}")
+        if concepts_dir is None:
+            concepts_dir = exp.concepts_dir
+        if output_dir is None:
+            output_dir = exp.analysis_dir
+    return Path(concepts_dir), Path(output_dir)
+
+
+def cmd_align(
+    sae_dir: Path,
+    embeddings_dir: Path,
+    concepts_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    experiment: Optional[str] = None,
+    exp_dir: Optional[Path] = None,
+    shard: Optional[int] = None,
+    threshold_min_f1: float = 0.0,
+    n_top_per_concept: int = 20,
+    feature_chunk_size: int = 200,
+    batch_size: int = 1024,
+    compute_auroc: bool = True,
+    compute_domain_f1: bool = True,
+    min_positives: int = 10,
+    threshold_percents: Optional[List[float]] = None,
+):
+    from single.analysis.concepts import load_concept_names
+    from single.paths import resolve_experiment
+
+    concepts_dir, output_dir = _resolve_dirs(
+        concepts_dir, output_dir, experiment, exp_dir
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("=" * 60)
+    print("SAE Feature × Concept Alignment")
+    print("=" * 60)
+
+    print("\nLoading SAE...")
+    sae = load_sae(sae_dir, device=device)
+    print(f"  {sae.__class__.__name__}: {sae.dict_size} features, {sae.activation_dim}D")
+
+    concept_names = load_concept_names(concepts_dir)
+    if not concept_names:
+        raise ValueError(f"No concept columns found in {concepts_dir}/aa_concepts_columns.txt")
+
+    print("\nLoading embeddings...")
+    shards_to_process = [shard] if shard is not None else list(range(len(list(Path(concepts_dir).glob("shard_*")))))
+
+    df = _align_shards(
+        sae, embeddings_dir, concepts_dir, concept_names, shards_to_process,
+        device, feature_chunk_size, batch_size, compute_auroc, compute_domain_f1,
+        min_positives, threshold_percents,
+    )
+
+    # Save full metrics (latest shard's metrics dict for JSON)
     # Save summary CSV (all pairs, no threshold filtering)
-    df = pd.DataFrame(all_pairs)
     if not df.empty:
         csv_path = output_dir / "feature_concept_pairs.csv"
         df.to_csv(csv_path, index=False)
-        print(f"Saved ALL {len(df)} feature-concept pairs to {csv_path}")
+        print(f"\nSaved ALL {len(df)} feature-concept pairs to {csv_path}")
 
         # Print top pairs (filtered by threshold_min_f1 for readability)
         has_domain = "f1_per_domain" in df.columns
@@ -199,14 +225,91 @@ def cmd_align(
     else:
         print("\nNo feature-concept pairs found.")
 
-    # Per-concept best features
-    print(f"\nTop {n_top_per_concept} features for each concept:")
-    for concept in concept_names:
-        concept_df = df[df["concept"] == concept]
-        if not concept_df.empty:
-            top = concept_df.nlargest(n_top_per_concept, "f1")
-            best = top.iloc[0]
-            print(f"  {concept}: Feature #{best['feature']} (F1={best['f1']:.3f})")
+    print(f"\n{'=' * 60}")
+    print("Done!")
+
+
+def cmd_heldout(
+    sae_dir: Path,
+    embeddings_dir: Path,
+    concepts_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    experiment: Optional[str] = None,
+    exp_dir: Optional[Path] = None,
+    split_mode: str = "half",
+    threshold_min_f1: float = 0.0,
+    feature_chunk_size: int = 200,
+    batch_size: int = 1024,
+    compute_auroc: bool = True,
+    compute_domain_f1: bool = True,
+    min_positives: int = 10,
+    threshold_percents: Optional[List[float]] = None,
+    heldout_f1_threshold: float = 0.3,
+):
+    """
+    Held-out validation: split concept shards into valid/test, select the top
+    feature per concept on the valid split, then evaluate those pairs on the
+    held-out test split (unbiased metrics).
+    """
+    from single.analysis.concepts import load_concept_names
+    from single.analysis.heldout import report_heldout
+
+    concepts_dir, output_dir = _resolve_dirs(
+        concepts_dir, output_dir, experiment, exp_dir
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("=" * 60)
+    print("SAE Feature × Concept Alignment (Held-out)")
+    print("=" * 60)
+
+    print("\nLoading SAE...")
+    sae = load_sae(sae_dir, device=device)
+    print(f"  {sae.__class__.__name__}: {sae.dict_size} features, {sae.activation_dim}D")
+
+    concept_names = load_concept_names(concepts_dir)
+    if not concept_names:
+        raise ValueError(f"No concept columns found in {concepts_dir}/aa_concepts_columns.txt")
+
+    # Split shards into valid / test
+    all_shards = list(range(len(list(Path(concepts_dir).glob("shard_*")))))
+    if split_mode == "half":
+        mid = len(all_shards) // 2
+        valid_shards, test_shards = all_shards[:mid], all_shards[mid:]
+    elif split_mode == "alternate":
+        valid_shards = all_shards[::2]
+        test_shards = all_shards[1::2]
+    else:
+        raise ValueError(f"Unknown split_mode: {split_mode} (use 'half' or 'alternate')")
+
+    print(f"\nValid shards: {valid_shards}")
+    print(f"Test shards:  {test_shards}")
+
+    # Run alignment on both splits
+    print("\n--- Valid split alignment (selection) ---")
+    df_valid = _align_shards(
+        sae, embeddings_dir, concepts_dir, concept_names, valid_shards,
+        device, feature_chunk_size, batch_size, compute_auroc, compute_domain_f1,
+        min_positives, threshold_percents,
+    )
+    valid_csv = output_dir / "heldout_valid_pairs.csv"
+    df_valid.to_csv(valid_csv, index=False)
+    print(f"  Valid split pairs saved to {valid_csv}")
+
+    print("\n--- Test split alignment (evaluation) ---")
+    df_test = _align_shards(
+        sae, embeddings_dir, concepts_dir, concept_names, test_shards,
+        device, feature_chunk_size, batch_size, compute_auroc, compute_domain_f1,
+        min_positives, threshold_percents,
+    )
+    test_csv = output_dir / "heldout_test_pairs.csv"
+    df_test.to_csv(test_csv, index=False)
+    print(f"  Test split pairs saved to {test_csv}")
+
+    # Held-out report
+    report_heldout(valid_csv, test_csv, output_dir, top_threshold=heldout_f1_threshold)
 
     print(f"\n{'=' * 60}")
     print("Done!")
@@ -258,10 +361,49 @@ def main():
     p_align.add_argument("--threshold_percents", type=float, nargs="+", default=None,
                          help="InterPLM-style percent-of-max thresholds, e.g. 0 0.15 0.5 0.6 0.8")
 
+    # heldout
+    p_held = sub.add_parser("heldout",
+                            help="Held-out validation: select on valid split, evaluate on test split")
+    p_held.add_argument("--sae_dir", type=Path, required=True)
+    p_held.add_argument("--embeddings_dir", type=Path, required=True)
+    p_held.add_argument("--experiment", type=str, default=None,
+                        help="Experiment name; creates Outputs/<experiment>_<ts>/")
+    p_held.add_argument("--exp_dir", type=Path, default=None,
+                        help="Reuse an existing experiment directory")
+    p_held.add_argument("--concepts_dir", type=Path, default=None,
+                        help="Explicit concepts dir (overrides experiment routing)")
+    p_held.add_argument("--output_dir", type=Path, default=None,
+                        help="Explicit output dir (overrides experiment routing)")
+    p_held.add_argument("--split_mode", type=str, default="half", choices=["half", "alternate"],
+                        help="How to split shards into valid/test: 'half' (first half valid) "
+                             "or 'alternate' (every other shard)")
+    p_held.add_argument("--threshold_min_f1", type=float, default=0.0)
+    p_held.add_argument("--feature_chunk_size", type=int, default=200)
+    p_held.add_argument("--batch_size", type=int, default=1024)
+    p_held.add_argument("--no_auroc", action="store_true",
+                        help="Skip AUROC computation (faster)")
+    p_held.add_argument("--no_domain_f1", action="store_true",
+                        help="Skip domain-level F1 (faster)")
+    p_held.add_argument("--min_positives", type=int, default=10)
+    p_held.add_argument("--threshold_percents", type=float, nargs="+", default=None,
+                        help="InterPLM-style percent-of-max thresholds, e.g. 0 0.15 0.5 0.6 0.8")
+    p_held.add_argument("--heldout_f1_threshold", type=float, default=0.3,
+                        help="Report held-out pairs with f1_per_domain above this")
+
     args = parser.parse_args()
     if args.command == "build":
         cmd_build(args.annotations_tsv, args.concepts_dir, args.experiment,
                   args.exp_dir, args.n_shards, args.min_seq_len, args.max_seq_len)
+    elif args.command == "heldout":
+        cmd_heldout(args.sae_dir, args.embeddings_dir, args.concepts_dir,
+                    args.output_dir, args.experiment, args.exp_dir,
+                    args.split_mode, args.threshold_min_f1,
+                    args.feature_chunk_size, args.batch_size,
+                    compute_auroc=not args.no_auroc,
+                    compute_domain_f1=not args.no_domain_f1,
+                    min_positives=args.min_positives,
+                    threshold_percents=args.threshold_percents,
+                    heldout_f1_threshold=args.heldout_f1_threshold)
     else:
         cmd_align(args.sae_dir, args.embeddings_dir, args.concepts_dir,
                   args.output_dir, args.experiment, args.exp_dir,

@@ -276,6 +276,96 @@ Note: to get exact per-protein alignment between embeddings and concept matrices
 extract embeddings from the **same TSV** with `extract_embeddings.py` (per-shard order
 must match). If shard counts differ, the script falls back to best-effort splitting.
 
+### Held-out Validation
+
+Reporting the "best feature per concept" with its F1 on the *same* data used for
+selection is optimistically biased — among 640 features, some will score high on a
+concept purely by chance (selection bias). Held-out validation separates selection
+from evaluation:
+
+1. Split concept shards into a **valid** split and a **test** split (non-overlapping).
+2. On the **valid** split, pick the top feature per concept (the *selection* step).
+3. On the **test** split, evaluate **only the selected pairs** — these metrics are
+   unbiased estimates of real performance on unseen data.
+
+```bash
+python -m single.scripts.analyze_concepts heldout \
+    --sae_dir ../Outputs/sp_*/sae \
+    --embeddings_dir ../Outputs/sp_*/embeddings/layer_6 \
+    --experiment sp \
+    --split_mode half \
+    --threshold_percents 0 0.15 0.5 0.6 0.8
+```
+
+Output files in the experiment's `analysis/` (see the data-flow below):
+
+```
+heldout_valid_pairs.csv  (all pairs on valid split)
+heldout_test_pairs.csv   (all pairs on test split)
+        │                        │
+        │  select top feature    │  keep only selected pairs
+        │  per concept ─────────►│
+        ▼                        ▼
+                          heldout_top_pairings.csv   (selected pairs, test metrics)
+                                │  filter f1_per_domain ≥ threshold
+                                ▼
+                          heldout_all_top_pairings.csv  (robust findings)
+```
+
+- `heldout_valid_pairs.csv` / `heldout_test_pairs.csv` — the full feature×concept
+  tables for each split (raw "mother" tables).
+- `heldout_top_pairings.csv` — one selected pair per concept, **metrics computed on
+  the test split only**. A large drop vs. the valid-split value reveals selection bias.
+- `heldout_all_top_pairings.csv` — the selected pairs that stay strong on the test
+  split (`f1_per_domain ≥ --heldout_f1_threshold`). **This is the most trustworthy
+  set of feature-concept findings.**
+
+### Fidelity (Loss Recovered)
+
+Fidelity validates that the SAE is a *faithful* representation of the fine-tuned
+model's task-relevant activations — the foundation that makes feature analysis
+meaningful. The target layer's hidden states are replaced three ways and the model's
+**task loss** (token classification) is compared:
+
+```
+ce_orig : original activations
+ce_sae  : SAE reconstructions injected
+ce_zero : layer zeroed (worst case)
+
+Loss_Recovered = 1 - (ce_sae - ce_orig) / (ce_zero - ce_orig)
+```
+
+- **100%** — the SAE perfectly preserves the information the model uses for its task.
+- **0%** — the SAE is as harmful as zeroing the layer (feature analysis would be moot).
+
+```bash
+python -m single.scripts.evaluate_fidelity \
+    --ckpt_path ../Training/outputs/tasks/my_task/checkpoints/best \
+    --sequences_csv ../Dataset/mBMRB.csv \
+    --sae_dir ../Outputs/sp_*/sae \
+    --experiment sp \
+    --layer 6 --label_column label --label_map mBMRB
+```
+
+Saves `fidelity_results.json` in the experiment's `analysis/`, including a
+`reconstruction_mse` sanity check (per-element MSE between SAE reconstruction and
+the original hidden states over non-padding residues; low ≈ the reconstruction is
+genuinely close). **Note:** injection currently supports the final layer
+(`hidden_states[6]` = `emb_layer_norm_after` output); intermediate layers need
+extended hooking.
+
+### f1 vs f1_per_domain
+
+- **`f1`** counts **residues**: requires every residue position to be predicted
+  correctly — strict, and skewed by domain length.
+- **`f1_per_domain`** counts **domain instances**: a domain is "hit" if the feature
+  activates anywhere within it — measures whether the feature *recognizes the
+  concept*, not its positional precision.
+
+InterPLM uses `f1_per_domain` as the primary concept-association metric. In held-out
+reports, prefer pairs with **high `f1_per_domain`** (robust recognition) rather than
+raw `f1`.
+
 ---
 
 ## Features
@@ -302,9 +392,54 @@ must match). If shard counts differ, the script falls back to best-effort splitt
 | **Feature-label alignment** | F1, AUROC, correlation, activation gap per feature |
 | **Feature-concept alignment** | F1/AUROC per feature vs Swiss-Prot biological concepts (multi-label) |
 | **UniProt annotation parsing** | TSV Feature-table annotations → per-residue sparse concept matrices |
+| **Domain-level F1** | `f1_per_domain` counts structural-domain instances hit, not just residues |
+| **Percentile thresholds** | InterPLM-style percent-of-max activation thresholds |
+| **Held-out validation** | Select on valid split, evaluate on held-out test split (unbiased) |
+| **Fidelity (loss recovered)** | Task loss preserved when SAE reconstructions replace layer activations |
 | **Per-protein tracking** | Find which proteins maximally activate each feature |
 | **Visualization** | Feature activation vs ground truth on sequences |
 | **Normalization** | Feature-wise max-activation normalization for meaningful comparisons |
+
+---
+
+## Planned Features
+
+> These functions are **not yet implemented** — placeholders for future work, in
+> priority order. They would go in `single/analysis/` alongside the existing tools.
+
+### Structure-vs-Sequence Scatter (planned)
+
+**Purpose:** distinguish whether a feature encodes a *3D structural* property or a
+*local sequence motif*. For each feature, compute two effect sizes:
+
+- `sequential Cohen's d` — how far (in sequence) the activated residues are from the
+  inactivated ones → whether the feature responds to a linear amino-acid pattern.
+- `structural Cohen's d` — whether the activated residues cluster in 3D space
+  (AlphaFold / PDB structures) → whether the feature encodes a spatial property.
+
+Plot `x = sequential`, `y = structural`. Features far above the diagonal encode
+spatially-clustered biology (e.g. a catalytic pocket), the most interesting
+interpretability finding; features near the diagonal are just sequence motifs.
+
+- **Dependencies:** per-protein AlphaFold/PDB structures (`Dataset/uniprot/`),
+  residue-level structural alignment.
+- **Suggested interface:** `single/scripts/analyze_structure_vs_sequence.py`.
+
+### Causal Intervention (planned)
+
+**Purpose:** move from *correlation* to *causation*. All current analysis shows that
+a feature *co-occurs* with a concept/label. Intervention directly perturbs a feature
+(e.g. zero or amplify Feature #375's activation) and observes whether the fine-tuned
+model's prediction actually changes.
+
+- If zeroing "acidic-region detector" Feature #375 flips the model's flexibility
+  prediction on acidic regions → the feature *causally drives* the model's decision.
+- Builds on Fidelity's activation-injection mechanism
+  (`single/train/fidelity.py`), extended from "whole-layer replacement" to
+  "per-feature perturbation" (feature steering / activation patching).
+
+- **Suggested interface:** `single/scripts/steer_features.py` or a
+  `single/analysis/intervention.py` module.
 
 ---
 
@@ -325,14 +460,13 @@ must match). If shard counts differ, the script falls back to best-effort splitt
 
 ## Dependencies
 
-```bash
-# Training
-pip install -r Training/requirements.txt
+A single root `requirements.txt` covers both the Training and SAE modules:
 
-# SAE Interpretability
-pip install -r Single/single/requirements.txt
+```bash
+pip install -r requirements.txt
 ```
-Or install the SAE package in development mode:
+Or install the SAE package in development mode (pulls its dependencies from
+`setup.py`):
 ```bash
 cd Single && pip install -e .
 ```
@@ -370,3 +504,42 @@ Outputs/
 `single/paths.py` centralizes these paths; scripts resolve subdirectories from the
 experiment dir automatically. Explicit `--output_dir` / `--save_dir` /
 `--concepts_dir` flags override the routing when you need custom locations.
+
+---
+
+## Citation
+
+A manuscript is in preparation. In the meantime, if you use this code in your
+research, please cite the repository:
+
+```bibtex
+@misc{crossplm,
+  author       = {Bingwu, Li and collaborators},
+  title        = {CrossPLM: Cross-Task Mechanistic Interpretability for Protein Language Models},
+  year         = {2026},
+  howpublished = {\url{https://github.com/lbwfff/CrossPLM}},
+  note         = {SAE-based interpretability module: {S}parse {A}utoencoder feature extraction, concept alignment, held-out validation, and fidelity evaluation}
+}
+```
+
+Or cite it as:
+
+> CrossPLM: Cross-Task Mechanistic Interpretability for Protein Language Models.
+> GitHub repository, https://github.com/lbwfff/CrossPLM.
+
+Please also consider citing the method this project builds upon (the SAE-based
+feature-extraction and concept-alignment approach):
+
+```bibtex
+@article{simon2025interplm,
+  title={InterPLM: discovering interpretable features in protein language models via sparse autoencoders},
+  author={Simon, Elana and Zou, James},
+  journal={Nature Methods},
+  year={2025},
+  doi={10.1038/s41592-025-02836-7},
+  url={https://www.nature.com/articles/s41592-025-02836-7}
+}
+```
+
+> **Note:** The `@misc` entry above uses a placeholder author/description. Update
+> `author` and `note` once the repository metadata is finalized.
