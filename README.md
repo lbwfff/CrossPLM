@@ -150,17 +150,22 @@ python -m single.scripts.visualize_features \
     --feature_indices 234 426 --label_map mBMRB
 ```
 
-`visualize_features` 默认从实验目录推断嵌入文件
-`Outputs/<exp>/embeddings/layer_<N>/shard_<S>/activations.pt`（`--layer` 默认 6，`--shard` 默认 0）。
-如需指定其它 shard，加 `--shard 1`；也可用 `--embeddings_path <file>` 显式覆盖。
-它会按 `--experiment` 重新对 CSV 做与提取时相同的打乱+分片（`sample(frac=1, random_state=42)`），
-确保展示的蛋白与其嵌入、标签严格对齐，并输出 PNG 到 `Outputs/<exp>/analysis/visualizations/`。
+`visualize_features` infers the embeddings file from the experiment directory:
+`Outputs/<exp>/embeddings/layer_<N>/shard_<S>/activations.pt` (`--layer` default 6,
+`--shard` default 0). Pass `--shard 1` to use a different shard, or override with
+`--embeddings_path <file>`. It re-applies the same shuffle+shard as extraction
+(`sample(frac=1, random_state=42)`) so the displayed proteins, their embeddings,
+and labels stay strictly aligned, and writes PNGs to
+`Outputs/<exp>/analysis/visualizations/`.
 
-`train_sae` 同样默认从实验目录推断嵌入（`Outputs/<exp>/embeddings/layer_<N>`，含全部 shard），
-可用 `--embeddings_dir` 覆盖；`--shard N` 只训练单个 shard。常用调参提示：
-- `--l1_penalty` 控制稀疏度（约 0.06–0.1），值越大特征越稀疏（l0 越低）但重构损失越高
-- `--resample_steps N` 周期性复活"死特征"（从不激活的特征），可降低 `dead_pct`
-- 理想目标：**l0 在 20–80、dead_pct < 30%、recon_loss 尽量低**
+`train_sae` likewise infers embeddings from the experiment directory
+(`Outputs/<exp>/embeddings/layer_<N>`, using ALL shards by default), overridable
+with `--embeddings_dir`; `--shard N` trains on a single shard. Tuning tips:
+- `--l1_penalty` controls sparsity (~0.06–0.1); higher → sparser features (lower
+  `l0`) but higher reconstruction loss.
+- `--resample_steps N` periodically revives "dead" features (never activated),
+  lowering `dead_pct`.
+- Target: **`l0` between 20–80, `dead_pct` < 30%, and `recon_loss` as low as possible**.
 
 Note: `--experiment <name>` routes all outputs into `Outputs/<name>/` — the name
 is used **verbatim (no timestamp)**, so every step of the same experiment shares
