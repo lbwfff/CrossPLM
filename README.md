@@ -121,9 +121,15 @@ Fine-tuned PLM checkpoint
 [3] analyze_features.py     → (A) Align features with task labels   (rigid/flexible)
 [4] analyze_concepts.py     → (B) Align features with biological concepts (Swiss-Prot)
          ↓
-[5] heldout / fidelity      → (C) Validate the findings (unbiased, faithful)
+[5] heldout / fidelity /    → (C) Validate the findings (unbiased, faithful,
+    evaluate_intervention        and causal)
          ↓
-[6] visualize_features.py   → Plot feature activation patterns on protein sequences
+[6] analyze_sequence.py     → (D) Characterize features along the sequence
+                               (Cohen's d + motif enrichment)
+         ↓
+[7] analyze_coactivation.py → (E) Compare pairs of features (co-localized vs disjoint)
+         ↓
+[8] visualize_features.py   → Plot feature activation patterns on protein sequences
 ```
 
 ### How SAEs Work
@@ -328,28 +334,110 @@ Saves `fidelity_results.json` incl. a `reconstruction_mse` sanity check.
 **Note:** injection currently supports the final layer only
 (`hidden_states[6]` = `emb_layer_norm_after` output).
 
+**Causal intervention (feature steering)** moves from *correlation* to
+*causation*. Whereas Fidelity replaces the whole layer, intervention perturbs a
+**single SAE feature** and measures whether the model's per-residue predictions
+change — establishing that the feature *causally drives* (not just co-occurs
+with) the model's decision.
+
+```bash
+python -m single.scripts.evaluate_intervention \
+    --ckpt_path ../Training/outputs/tasks/my_task/checkpoints/best \
+    --sequences_csv ../Dataset/mBMRB.csv \
+    --sae_dir ../Outputs/mb/sae \
+    --experiment mb \
+    --feature_idx 375 --mode zero \
+    --label_column label --label_map mBMRB \
+    --layer 6 --max_sequences 200
+```
+
+- `--feature_idx N` — the feature to perturb.
+- `--mode zero|amplify|set` — set to 0, scale up (`--scale`), or force a value.
+- Outputs `intervention_feat<N>_<mode>.json` with **flip-rate** metrics:
+  - `flip_rate_on_active` — how often predictions change **on tokens where the
+    feature actually fires** (the causal effect).
+  - `flip_rate_on_inactive` — the **control baseline** on tokens where the feature
+    does NOT fire. If `active >> inactive`, the effect is real; if similar, it's
+    noise.
+
+*Note: single-feature effects are typically a few % (each token uses ~60
+features, so one feature tips only borderline samples). Compare against the
+inactive control rather than reading the absolute value.*
+
+### 2.4 Sequence Analysis (Cohen's d + Motif Enrichment)
+
+Characterizes *what along the sequence* a feature responds to, using only
+sequence data (no 3D structures required):
+
+- **Sequential Cohen's d** — are the feature's activated residues **clustered**
+  along the sequence (local/motif-like) or **dispersed** (global/periodic)?
+  Negative d = clustered, ~0 = random, positive = dispersed.
+- **Motif enrichment** — which amino acids are over-represented in a window
+  (`--flank`, default 3) around the activated residues — the amino-acid
+  "signature" of the feature.
+
+```bash
+python -m single.scripts.analyze_sequence \
+    --sae_dir ../Outputs/mb/sae \
+    --embeddings_dir ../Outputs/mb/embeddings/layer_6 \
+    --sequences_csv ../Dataset/mBMRB.csv \
+    --experiment mb \
+    --feature_indices 375 42 \
+    --shard 0
+```
+
+Example output (Feature #42, the "flexibility detector"):
+```
+Sequential Cohen's d: -0.074  → ~random
+Top enriched amino acids (log2 fold):
+  P: +0.40   S: +0.37   G: +0.32   D: +0.26   C: +0.12
+```
+P/S/G/D are classic flexible/loop residues — consistent with a flexibility
+detector. Saves `sequence_analysis_shard<N>.json` in the experiment's `analysis/`.
+
+### 2.5 Pairwise Feature Co-Activation
+
+Answers whether two features activate on the **same residues**, on residues
+**near each other** along the sequence, or on **disjoint** sets — revealing
+redundant vs complementary (co-regulatory) features.
+
+```bash
+python -m single.scripts.analyze_coactivation \
+    --sae_dir ../Outputs/mb/sae \
+    --embeddings_dir ../Outputs/mb/embeddings/layer_6 \
+    --sequences_csv ../Dataset/mBMRB.csv \
+    --experiment mb \
+    --feature_a 375 --feature_b 42 \
+    --shard 0
+```
+
+Key metrics (each compared to the unconditional activation-rate baseline):
+- `overlap_ab` / `enrich_ab` — same-residue co-activation; **>1** → B enriched on
+  A's residues, **<1** → mutually exclusive at the same position.
+- `neighbor_ab` / `neighbor_enrich_ab` — B active within ±`--neighborhood`
+  residues of an A-active residue; **>>1** → features co-localize nearby.
+- Both directions (A→B and B→A) are reported to detect asymmetry.
+
+Example (Features #375 and #42): same-residue enrichment **0.69×** (mutually
+exclusive at identical positions) but neighborhood enrichment **3.7–6.4×**
+(strongly co-localized within ±5 residues) → they are **complementary detectors
+that alternate along the sequence**, not redundant. Saves
+`coactivation_<a>_<b>_shard<N>.json`.
+
 ---
 
 ## Module 3: Crossing — Planned
 
 Not yet implemented. Planned directions:
 
-- **Single-model**: neuron / attention-head importance, causal intervention
-  (activation patching), representation probing.
+- **Single-model**: neuron / attention-head importance, representation probing.
 - **Cross-model**: comparative analysis across PLMs (ESM-2, ProtBERT, Ankh),
   task-specific vs task-common representation separation, feature transferability.
 
-Concrete placeholders for future work (would live in `single/analysis/`):
-
-**Structure-vs-Sequence Scatter** — distinguishes whether a feature encodes a 3D
-structural property or a local sequence motif. Plot `x = sequential Cohen's d`,
-`y = structural Cohen's d`; features far above the diagonal encode spatially
-clustered biology (e.g. a catalytic pocket).
-
-**Causal Intervention** — moves from correlation to causation: perturb a feature
-(e.g. zero or amplify Feature #375) and observe whether the model's prediction
-changes. Builds on Fidelity's activation-injection mechanism, extended to
-per-feature perturbation (feature steering).
+**Structural analysis (planned):** the *structure* side of the structure-vs-
+sequence scatter — plot `x = sequential Cohen's d` (implemented above) against
+`y = structural Cohen's d`. Features far above the diagonal encode spatially
+clustered biology (e.g. a catalytic pocket). *Requires PDB/AlphaFold structures.*
 
 ---
 
@@ -385,6 +473,9 @@ Outputs/
         ├── feature_label_metrics.json                  # Task-label alignment
         ├── heldout_*.csv                               # Held-out validation
         ├── fidelity_results.json                       # Fidelity
+        ├── intervention_feat<N>_<mode>.json            # Causal intervention
+        ├── sequence_analysis_shard<N>.json             # Cohen's d + motif
+        ├── coactivation_<a>_<b>_shard<N>.json          # Pairwise co-activation
         └── visualizations/                             # PNG plots
 ```
 
