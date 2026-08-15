@@ -41,6 +41,12 @@ class TrainingConfig:
     class_weight_method: str = "inverse"
     ignore_pad_token_for_loss: bool = True
     resume_from_checkpoint: Optional[str] = None
+    # Optional label-map preset (from Single's single/label_maps.py) or path to a
+    # YAML label-map file. When set, the training label->id mapping is taken from
+    # it (deterministic, consistent with the interpretability module) instead of
+    # being inferred from the CSV with sorted(unique). E.g. "ss3" for 3-class
+    # secondary structure {H:0, E:1, C:2}. Leave empty to infer from data.
+    label_map: str = ""
 
     def __post_init__(self):
         for field_name, field_type in self.__annotations__.items():
@@ -62,7 +68,9 @@ class TrainingConfig:
         import yaml
         with open(path) as f:
             raw = yaml.safe_load(f)
-        return cls(**{k: v for k, v in raw.items() if not k.startswith("#") and v is not None})
+        # Note: YAML comments are already stripped by the parser, so only drop
+        # explicitly-null values (YAML allows `key:` with no value).
+        return cls(**{k: v for k, v in raw.items() if v is not None})
 
     @staticmethod
     def generate_template(path: str):

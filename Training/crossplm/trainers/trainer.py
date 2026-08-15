@@ -19,6 +19,7 @@ class Trainer:
         eval_dataset=None,
         task_dir: Optional[str] = None,
         class_weights=None,
+        n_classes: Optional[int] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -27,6 +28,11 @@ class Trainer:
         self.eval_dataset = eval_dataset
         self.task_dir = task_dir
         self.class_weights = class_weights
+        # Total number of classes (from the label map). Used for macro-F1 so that
+        # training-time F1 matches cmd_eval's (classes absent from the eval split
+        # contribute 0 instead of being excluded). Falls back to class_weights
+        # length, then to observed classes.
+        self.n_classes = n_classes if n_classes is not None else (len(class_weights) if class_weights is not None else None)
         self.top_k = 3
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -200,11 +206,20 @@ class Trainer:
         return metrics
 
     def _compute_f1(self, predictions, labels):
-        num_classes = max(max(predictions), max(labels)) + 1
+        if not predictions or not labels:
+            return 0.0
+        # Use the total number of classes (consistent with cmd_eval) when known,
+        # so classes absent from this eval split contribute 0 to the macro average.
+        if self.n_classes is not None:
+            num_classes = self.n_classes
+        else:
+            num_classes = max(max(predictions), max(labels)) + 1
         tp = [0] * num_classes
         fp = [0] * num_classes
         fn = [0] * num_classes
         for p, l in zip(predictions, labels):
+            if p >= num_classes or l >= num_classes:
+                continue  # safety: ignore out-of-range class ids
             if p == l:
                 tp[p] += 1
             else:

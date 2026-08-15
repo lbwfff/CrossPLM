@@ -50,7 +50,6 @@ def align_features_to_labels(
     n_features = sae.dict_size
 
     best_metrics = {}
-    all_aurocs = np.zeros(n_features)
 
     for feature_list in tqdm(
         split_up_feature_list(n_features, feature_chunk_size),
@@ -92,7 +91,6 @@ def align_features_to_labels(
                 auroc = roc_auc_score(labels_binary, feat_acts)
             except ValueError:
                 auroc = 0.5
-            all_aurocs[int(global_feat_idx)] = auroc
 
             best_f1 = 0.0
             best_prec = 0.0
@@ -150,8 +148,12 @@ def compute_feature_label_correlation(
     positive_class: int = 1,
 ) -> np.ndarray:
     """
-    Compute point-biserial correlation between each feature's activation
-    and the binary label (0=negative, positive_class=positive).
+    Compute point-biserial correlation between each feature's activation and the
+    binary "is this residue in positive_class?" label (one-vs-rest).
+
+    For multi-class label maps (e.g. ss3), residues of all OTHER classes are
+    treated as the negative group; correlation measures how well the feature
+    separates positive_class from everything else.
 
     Returns array of shape (n_features,) with correlation coefficients.
     """
@@ -191,21 +193,35 @@ def compute_feature_activation_profile(
     negative_class: int = 0,
     pos_name: str = "positive",
     neg_name: str = "negative",
+    label_map_spec: Optional[dict] = None,
 ) -> Dict:
     """
-    For each feature, compute mean/max activation on negative vs positive class residues.
+    For each feature, compute mean/max activation per class.
+
+    With a binary label map (default) this is the classic positive-vs-negative
+    profile (activation_gap = pos_mean - neg_mean). With a multi-class label map
+    (e.g. ss3: classes 0/1/2), one profile column is produced per class, and
+    activation_gap is positive_class mean minus the mean over ALL other classes
+    (so no class is silently ignored).
     """
     device = embeddings.device
     n_features = sae.dict_size
 
-    pos_means = np.zeros(n_features)
-    neg_means = np.zeros(n_features)
-    pos_max = np.zeros(n_features)
-    neg_max = np.zeros(n_features)
+    # Determine classes: if a label_map_spec is given, iterate ALL of its classes;
+    # otherwise fall back to the binary positive/negative pair.
+    if label_map_spec is not None:
+        class_ids = sorted({int(v) for v in label_map_spec.get("mapping", {}).values()})
+    else:
+        class_ids = sorted({int(negative_class), int(positive_class)})
+
+    means = {c: np.zeros(n_features) for c in class_ids}
+    maxes = {c: np.zeros(n_features) for c in class_ids}
+    masks = {c: (labels != -100) & (labels == c) for c in class_ids}
 
     valid = labels != -100
-    neg_mask = valid & (labels == negative_class)
-    pos_mask = valid & (labels == positive_class)
+    # "other" = all valid residues not in the positive class (for activation_gap)
+    if positive_class in class_ids:
+        other_mask = valid & (labels != positive_class)
 
     for feature_list in tqdm(
         split_up_feature_list(n_features, feature_chunk_size),
@@ -222,20 +238,36 @@ def compute_feature_activation_profile(
         feats_np = feats.cpu().numpy()
 
         for i, fidx in enumerate(feature_list):
-            if neg_mask.any():
-                neg_means[fidx] = feats_np[neg_mask, i].mean()
-                neg_max[fidx] = feats_np[neg_mask, i].max()
-            if pos_mask.any():
-                pos_means[fidx] = feats_np[pos_mask, i].mean()
-                pos_max[fidx] = feats_np[pos_mask, i].max()
+            for c in class_ids:
+                if masks[c].any():
+                    means[c][fidx] = feats_np[masks[c], i].mean()
+                    maxes[c][fidx] = feats_np[masks[c], i].max()
 
-    return {
-        f"{neg_name}_mean_activation": neg_means,
-        f"{pos_name}_mean_activation": pos_means,
-        f"{neg_name}_max_activation": neg_max,
-        f"{pos_name}_max_activation": pos_max,
-        "activation_gap": pos_means - neg_means,
-    }
+    profile: Dict[str, np.ndarray] = {}
+    for c in class_ids:
+        name = label_map_spec["class_names"].get(c, str(c)) if label_map_spec else str(c)
+        profile[f"{name}_mean_activation"] = means[c]
+        profile[f"{name}_max_activation"] = maxes[c]
+
+    # activation_gap: positive class mean minus mean over all other classes.
+    if positive_class in class_ids:
+        others = [c for c in class_ids if c != positive_class]
+        if others:
+            other_mean = np.mean([means[c] for c in others], axis=0)
+        else:
+            other_mean = np.zeros(n_features)
+        profile["activation_gap"] = means[positive_class] - other_mean
+    else:
+        profile["activation_gap"] = np.zeros(n_features)
+
+    # Backward compatibility keys (binary callers may read these directly).
+    if negative_class in class_ids and positive_class in class_ids:
+        profile[f"{neg_name}_mean_activation"] = means[negative_class]
+        profile[f"{pos_name}_mean_activation"] = means[positive_class]
+        profile[f"{neg_name}_max_activation"] = maxes[negative_class]
+        profile[f"{pos_name}_max_activation"] = maxes[positive_class]
+
+    return profile
 
 
 # ---------------------------------------------------------------------------

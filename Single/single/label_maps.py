@@ -34,11 +34,14 @@ LABEL_MAPS: Dict[str, Dict] = {
         "mapping": {"p": 0, "A": 0, "v": 0, ".": 1, "b": 1, "^": 1},
         "ignore": "_",
     },
-    # Example for 3-class secondary structure
+    # Example for 3-class secondary structure. The integer ids are assigned to
+    # match the training module's build_label_map() (sorted(unique)) so that a
+    # model trained with an inferred label map evaluates consistently with this
+    # preset: C=0, E=1, H=2.
     "ss3": {
         "positive_class": 1,
-        "class_names": {0: "helix", 1: "strand", 2: "coil"},
-        "mapping": {"H": 0, "E": 1, "C": 2},
+        "class_names": {0: "coil", 1: "strand", 2: "helix"},
+        "mapping": {"C": 0, "E": 1, "H": 2},
         "ignore": "_",
     },
 }

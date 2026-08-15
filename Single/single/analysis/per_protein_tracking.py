@@ -80,15 +80,40 @@ class PerProteinActivationTracker:
 def find_max_activating_proteins(
     sae: Dictionary,
     embeddings: torch.Tensor,
-    protein_boundaries: List[Tuple[int, int]],
+    protein_lengths: List[int],
     protein_ids: List[str],
     feature_chunk_size: int = 200,
     n_top: int = 10,
     activation_threshold: float = 0.05,
     batch_size: int = 1024,
 ) -> Dict:
+    """
+    For each feature, find the proteins that activate it most.
+
+    Args:
+        sae: trained SAE
+        embeddings: [n_tokens, d_model] concatenated per-protein activations
+        protein_lengths: number of embedding tokens for each protein (in the
+            same order as embeddings). Pass the embedder's per-protein residue
+            count (min(len(seq), max_length-2)) — NOT the ambiguous
+            (start, end) boundary tuples produced by some embedder methods,
+            which are easy to mix up (closed vs open range, batch vs token offset).
+        protein_ids: identifier per protein (parallel to protein_lengths)
+        ...
+    """
     device = embeddings.device
     total_features = sae.dict_size
+
+    # Convert lengths to exclusive (start, end) token ranges.
+    boundaries: List[Tuple[int, int]] = []
+    cursor = 0
+    for length in protein_lengths:
+        boundaries.append((cursor, cursor + length))
+        cursor += length
+    assert cursor == embeddings.shape[0], (
+        f"sum(protein_lengths)={cursor} != embeddings.shape[0]={embeddings.shape[0]}; "
+        "protein_lengths must cover every token exactly once."
+    )
 
     tracker = PerProteinActivationTracker(
         total_features, n_top=n_top, activation_threshold=activation_threshold
@@ -108,7 +133,7 @@ def find_max_activating_proteins(
         )
         feats_np = feats.cpu().numpy()
 
-        for prot_id, (start, end) in zip(protein_ids, protein_boundaries):
+        for prot_id, (start, end) in zip(protein_ids, boundaries):
             prot_feats = feats_np[start:end]
             tracker.update(prot_feats, protein_id=str(prot_id), feature_ids=feature_list)
 

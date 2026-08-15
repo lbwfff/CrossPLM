@@ -88,7 +88,11 @@ class FineTunedESMEmbedder:
             logits = outputs.logits.detach().cpu()
 
             for seq_idx, seq in enumerate(batch_seqs):
-                seq_len = len(seq)
+                # Use the SAME truncation as extract_embeddings_with_labels:
+                # tokenizer keeps at most max_length tokens (incl. CLS/EOS), so
+                # at most max_length-2 residues. Using min() here prevents an
+                # out-of-bounds slice (and a length mismatch) for long sequences.
+                seq_len = min(len(seq), self.max_length - 2)
                 seq_emb = layer_output[seq_idx, 1 : seq_len + 1, :]
                 all_embeddings.append(seq_emb)
 

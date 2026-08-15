@@ -54,9 +54,25 @@ class SAETrainingRun:
         save_dir = Path(self.checkpoint_cfg.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        progress = tqdm(range(steps), desc="Training SAE", unit="step")
+        # Resume support: if we resumed from a checkpoint, start at the saved
+        # step instead of 0, and skip the optimizer/scheduler warm-up that was
+        # already applied. If no checkpoint was loaded, start from step 0.
+        start_step = self.training_state["current_step"]
+        if start_step >= steps:
+            print(f"Already trained {start_step}/{steps} steps; nothing to do.")
+            return
+
+        progress = tqdm(range(start_step, steps), desc="Training SAE",
+                        unit="step", initial=start_step)
+        data_iter = iter(self.data)
         for step in progress:
-            batch = next(iter(self.data))
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                # One pass over the dataset finished: start a new epoch and
+                # continue sampling fresh batches (so all tokens get used).
+                data_iter = iter(self.data)
+                batch = next(data_iter)
             loss_val = trainer.update(step, batch)
             self.training_state["n_tokens_total"] += batch.shape[0]
             self.training_state["current_step"] = step
@@ -77,6 +93,8 @@ class SAETrainingRun:
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 trainer.save_checkpoint(ckpt_dir)
                 t.save(trainer.ae.state_dict(), save_dir / f"ae_step_{step}.pt")
+                # Persist training_state so --resume_from can pick up the step.
+                t.save(self.training_state, ckpt_dir / "training_state.pt")
 
         t.save(trainer.ae.state_dict(), save_dir / "ae.pt")
         print(f"\n{'='*50}")
@@ -103,6 +121,7 @@ class SAETrainingRun:
             batch_size=train_cfg.batch_size,
             seed=train_cfg.seed,
             samples_to_skip=data_cfg.samples_to_skip,
+            shard=data_cfg.shard,
         )
 
         trainer = ReLUTrainer(train_cfg)
@@ -111,6 +130,10 @@ class SAETrainingRun:
 
     def resume_from_checkpoint(self, checkpoint_dir: Path):
         self.trainer.update_from_checkpoint(checkpoint_dir)
-        state = t.load(checkpoint_dir / "training_state.pt")
-        self.training_state.update(state)
-        print(f"Resumed from step {self.training_state['current_step']}")
+        state_path = checkpoint_dir / "training_state.pt"
+        if state_path.exists():
+            self.training_state.update(t.load(state_path, weights_only=True))
+            print(f"Resumed from step {self.training_state['current_step']}")
+        else:
+            # Legacy checkpoint saved before training_state.pt existed; start from 0.
+            print(f"Checkpoint {checkpoint_dir} has no training_state.pt; starting from step 0.")

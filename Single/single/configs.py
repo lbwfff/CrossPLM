@@ -40,6 +40,7 @@ class DataConfig:
     n_shards_to_include: Optional[int] = None
     samples_to_skip: int = 0
     target_dtype: str = "float32"
+    shard: Optional[int] = None  # None = use all shards; else only that shard
 
 
 @dataclass

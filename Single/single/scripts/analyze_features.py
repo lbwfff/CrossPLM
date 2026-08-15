@@ -28,7 +28,6 @@ from single.analysis.feature_alignment import (
     compute_feature_label_correlation,
     compute_feature_activation_profile,
 )
-from single.analysis.per_protein_tracking import find_max_activating_proteins
 
 
 def analyze_features(
@@ -42,6 +41,7 @@ def analyze_features(
     activation_threshold: float = 0.05,
     n_top_features: int = 50,
     label_map: str = "mBMRB",
+    max_length: int = 512,
 ):
     from single.paths import resolve_experiment
 
@@ -102,20 +102,63 @@ def analyze_features(
 
     print(f"   Embeddings shape: {embeddings.shape}")
 
-    # 3. Load labels from CSV if not in shards
+    # 3. Load labels from CSV if not in shards.
+    # IMPORTANT: when embeddings were extracted with n_shards>1, extract_embeddings.py
+    # shuffles the DataFrame (sample(frac=1, random_state=42)) BEFORE sharding, so the
+    # per-shard protein order is NOT the original CSV order. To keep labels aligned with
+    # embeddings, we must replicate that exact shuffle+shard here.
     if labels is None and sequences_csv is not None and label_column is not None:
-        print("\n3. Parsing labels from CSV...")
+        print("\n3. Parsing labels from CSV (replicating extract_embeddings shuffle+shard)...")
         with open(sequences_csv, "r") as _f:
             _first = _f.readline()
         _sep = "\t" if _first.count("\t") > _first.count(",") else ","
         df = pd.read_csv(sequences_csv, sep=_sep, low_memory=False)
         df[label_column] = df[label_column].fillna("").astype(str)
+        if "sequence" not in df.columns:
+            raise ValueError(
+                "CSV must contain a 'sequence' column to align labels with "
+                "truncated embeddings (sequences longer than max_length-2 are "
+                "truncated by the embedder)."
+            )
 
         from single.label_maps import encode_label_string
+        import numpy as _np
+
+        # Max residues kept per protein by the embedder (CLS + EOS take 2 slots).
+        max_residues = max_length - 2  # default 512 -> 510
+
+        # Determine number of shards from the embeddings directory.
+        data_path = Path(embeddings_dir)
+        if data_path.is_dir():
+            n_shards = len(list(data_path.glob("shard_*")))
+        else:
+            n_shards = 1
+
+        # Replicate extract_embeddings.py: sample(frac=1, random_state=42) then split.
+        df_shuf = df.sample(frac=1, random_state=42).reset_index(drop=True)
         all_labels = []
-        for seq_idx, label_str in enumerate(tqdm(df[label_column], desc="Parsing labels")):
-            label_str = label_str.strip()
-            all_labels.extend(encode_label_string(label_str, label_map_spec))
+
+        def _encode_truncated(seq, label_str):
+            # Match extract_embeddings_with_labels: keep min(len(seq), max-2) residues.
+            seq_len = min(len(str(seq)), max_residues)
+            truncated = str(label_str).strip()[:seq_len]
+            return encode_label_string(truncated, label_map_spec)
+
+        if n_shards > 1:
+            _shard_size = int(_np.ceil(len(df_shuf) / n_shards))
+            shards = [df_shuf.iloc[i:i + _shard_size].reset_index(drop=True)
+                      for i in range(0, len(df_shuf), _shard_size)]
+            for shard_df in shards:
+                for seq, label_str in zip(tqdm(shard_df["sequence"],
+                                                desc="Parsing labels"),
+                                          shard_df[label_column]):
+                    all_labels.extend(_encode_truncated(seq, label_str))
+        else:
+            for seq, label_str in zip(tqdm(df_shuf["sequence"],
+                                          desc="Parsing labels"),
+                                      df_shuf[label_column]):
+                all_labels.extend(_encode_truncated(seq, label_str))
+
         labels = torch.tensor(all_labels, device=device)
 
     if labels is not None and labels.shape[0] != embeddings.shape[0]:
@@ -162,21 +205,25 @@ def analyze_features(
 
         np.save(output_dir / "feature_label_correlations.npy", correlations)
 
-        # Activation profile
-        print(f"\n6. Computing activation profiles ({neg_name} vs {pos_name})...")
+        # Activation profile (multi-class aware when label_map has >2 classes)
+        n_classes = len(set(label_map_spec.get("mapping", {}).values())) if label_map_spec else 2
+        if n_classes > 2:
+            print(f"\n6. Computing activation profiles per class ({n_classes} classes)...")
+        else:
+            print(f"\n6. Computing activation profiles ({neg_name} vs {pos_name})...")
         profile = compute_feature_activation_profile(
             sae, embeddings, labels,
             positive_class=positive_class,
             pos_name=pos_name, neg_name=neg_name,
+            label_map_spec=label_map_spec,
         )
 
         gap = profile["activation_gap"]
         top_pos_features = np.argsort(gap)[::-1][:20]
-        print(f"   Features with highest activation gap ({pos_name} - {neg_name}):")
+        print(f"   Features with highest activation gap ({pos_name} vs others):")
         for fidx in top_pos_features:
             print(f"     Feature #{fidx}: gap={gap[fidx]:.4f} "
-                  f"({neg_name}_mean={profile[f'{neg_name}_mean_activation'][fidx]:.4f}, "
-                  f"{pos_name}_mean={profile[f'{pos_name}_mean_activation'][fidx]:.4f})")
+                  f"({pos_name}_mean={profile[f'{pos_name}_mean_activation'][fidx]:.4f})")
 
         np.savez(output_dir / "activation_profile.npz", **profile)
 
@@ -227,5 +274,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_top_features", type=int, default=50)
     parser.add_argument("--label_map", type=str, default="mBMRB",
                         help="Label encoding preset name or path to YAML label-map file")
+    parser.add_argument("--max_length", type=int, default=512,
+                        help="Max length used at embedding extraction; labels are "
+                             "truncated to max_length-2 to match truncated sequences")
     args = parser.parse_args()
     analyze_features(**{k: v for k, v in vars(args).items() if v is not None})

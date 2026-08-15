@@ -22,10 +22,12 @@ from single.train.training_run import SAETrainingRun
 
 
 def train_sae(
-    embeddings_dir: Path,
+    embeddings_dir: Optional[Path] = None,
     save_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    layer: int = 6,
+    shard: Optional[int] = None,
     activation_dim: int = 320,
     dict_size: int = 1280,
     expansion_factor: int = 4,
@@ -35,23 +37,39 @@ def train_sae(
     l1_penalty: float = 0.06,
     warmup_steps: int = 1000,
     decay_start: int = 8000,
+    resample_steps: Optional[int] = None,
     save_steps: int = 2000,
     seed: int = 42,
     resume_from: Optional[Path] = None,
 ):
     from single.paths import resolve_experiment
 
+    # Resolve experiment dir first (needed for default embeddings/save paths).
+    if experiment is None and exp_dir is None:
+        raise ValueError("Must provide either --experiment or --exp_dir")
+    exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+    print(f"Experiment dir: {exp.dir}")
+
+    # Prefer explicit embeddings_dir; else infer Outputs/<exp>/embeddings/layer_<N>
+    # (which contains ALL shards for that layer — shard_0..shard_N-1).
+    if embeddings_dir is None:
+        embeddings_dir = exp.embeddings_dir(layer=layer)
+        print(f"Using embeddings from: {embeddings_dir}")
+
     # Prefer explicit save_dir (legacy); else route into the experiment dir.
     if save_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
         save_dir = exp.sae_dir
-        print(f"Experiment dir: {exp.dir}")
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     data_cfg = DataConfig(
         plm_embd_dir=embeddings_dir,
+        shard=shard,
     )
+    if shard is not None:
+        print(f"Using only shard {shard}")
+    else:
+        print("Using all shards")
 
     sae_cfg = SAEConfig(
         activation_dim=activation_dim,
@@ -66,6 +84,7 @@ def train_sae(
         warmup_steps=warmup_steps,
         decay_start=decay_start,
         l1_penalty=l1_penalty,
+        resample_steps=resample_steps,
         seed=seed,
     )
 
@@ -102,13 +121,19 @@ def train_sae(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train SAE on PLM embeddings")
-    parser.add_argument("--embeddings_dir", type=Path, required=True)
+    parser.add_argument("--embeddings_dir", type=Path, default=None,
+                        help="Embeddings dir to train on (default: "
+                             "Outputs/<experiment>/embeddings/layer_<N>, all shards)")
     parser.add_argument("--experiment", type=str, default=None,
-                        help="Experiment name; creates Outputs/<experiment>_<ts>/")
+                        help="Experiment name; routes outputs into Outputs/<experiment>/")
     parser.add_argument("--exp_dir", type=Path, default=None,
                         help="Reuse an existing experiment directory")
     parser.add_argument("--save_dir", type=Path, default=None,
                         help="Explicit save dir (overrides experiment routing)")
+    parser.add_argument("--layer", type=int, default=6,
+                        help="Embedding layer to train on (for default embeddings_dir)")
+    parser.add_argument("--shard", type=int, default=None,
+                        help="Train on only one shard (default: use all shards)")
     parser.add_argument("--activation_dim", type=int, default=320)
     parser.add_argument("--dict_size", type=int, default=1280)
     parser.add_argument("--expansion_factor", type=int, default=4)
@@ -118,6 +143,8 @@ if __name__ == "__main__":
     parser.add_argument("--l1_penalty", type=float, default=0.06)
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--decay_start", type=int, default=8000)
+    parser.add_argument("--resample_steps", type=int, default=None,
+                        help="Reinitialize dead neurons every N steps (reduces dead_pct)")
     parser.add_argument("--save_steps", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from", type=Path, default=None)

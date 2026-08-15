@@ -127,7 +127,7 @@ def plot_feature_summary(
 
 def visualize_features(
     sae_dir: Path,
-    embeddings_path: Path,
+    embeddings_path: Optional[Path] = None,
     output_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
@@ -138,16 +138,32 @@ def visualize_features(
     n_features: int = 10,
     max_proteins: int = 3,
     label_map: str = "mBMRB",
+    layer: int = 6,
+    shard: int = 0,
+    max_length: int = 512,
 ):
     from single.paths import resolve_experiment
 
-    # Prefer explicit output_dir (legacy); else route into the experiment dir.
+    if experiment is None and exp_dir is None and embeddings_path is None:
+        raise ValueError("Must provide --embeddings_path, or --experiment/--exp_dir")
+    exp = resolve_experiment(exp_dir=exp_dir, name=experiment) if (experiment or exp_dir) else None
+
+    # Prefer explicit output_dir; else route into the experiment dir.
     if output_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        if exp is None:
+            raise ValueError("--output_dir required when no experiment is given")
         output_dir = exp.visualizations_dir()
         print(f"Experiment dir: {exp.dir}")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Infer embeddings path from experiment if not given:
+    # Outputs/<exp>/embeddings/layer_<N>/shard_<S>/activations.pt
+    if embeddings_path is None:
+        emb_dir = exp.embeddings_dir(layer=layer) / f"shard_{shard}"
+        embeddings_path = emb_dir / "activations.pt"
+        print(f"Inferred embeddings path: {embeddings_path}")
+    embeddings_path = Path(embeddings_path)
 
     from single.label_maps import get_label_map
     label_map_spec = get_label_map(label_map)
@@ -167,25 +183,46 @@ def visualize_features(
         embeddings = data.to(device)
         labels = None
 
-    # Build boundaries from CSV: each sequence's token range in the concatenated tensor
+    # Build boundaries from the CSV. IMPORTANT: extract_embeddings.py shuffles the
+    # DataFrame (sample(frac=1, random_state=42)) before sharding, so we must
+    # replicate that exact order to align proteins with embedding tokens. If a
+    # given shard contains no labels, we skip label overlay for that protein.
     boundaries = []
     if sequences_csv:
         import pandas as pd
+        import numpy as _np
         with open(sequences_csv, "r") as _f:
             _first = _f.readline()
         _sep = "\t" if _first.count("\t") > _first.count(",") else ","
         df = pd.read_csv(sequences_csv, sep=_sep, low_memory=False)
-        sequences = df[sequence_column].tolist()
-        if label_column and label_column in df.columns:
-            df[label_column] = df[label_column].fillna("").astype(str)
-            seq_labels = df[label_column].tolist()
+        df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+
+        # Determine shard count from the embeddings directory (for the given layer).
+        n_shards = len(list(exp.embeddings_dir(layer=layer).glob("shard_*"))) if exp else 1
+        max_residues = max_length - 2
+
+        if n_shards > 1:
+            _shard_size = int(_np.ceil(len(df) / n_shards))
+            shards = [df.iloc[i:i + _shard_size].reset_index(drop=True)
+                      for i in range(0, len(df), _shard_size)]
+            if shard < len(shards):
+                shard_df = shards[shard]
+            else:
+                shard_df = df.iloc[:0]  # empty
         else:
-            seq_labels = None
+            shard_df = df
+
+        seq_labels = None
+        if label_column and label_column in shard_df.columns:
+            shard_df[label_column] = shard_df[label_column].fillna("").astype(str)
+            seq_labels = shard_df[label_column].tolist()
+
         start = 0
-        for seq in sequences[:max_proteins]:
-            seq_len = min(len(seq), 510)
+        for i, seq in enumerate(shard_df[sequence_column].tolist()[:max_proteins]):
+            seq_len = min(len(str(seq)), max_residues)
             end = start + seq_len
-            boundaries.append((start, end, seq, seq_labels[len(boundaries)] if seq_labels else None))
+            lbl = seq_labels[i] if seq_labels is not None else None
+            boundaries.append((start, end, str(seq), lbl))
             start = end
     else:
         sequences = ["M" * embeddings.shape[0]]
@@ -225,13 +262,22 @@ def visualize_features(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize SAE feature activations on proteins")
     parser.add_argument("--sae_dir", type=Path, required=True)
-    parser.add_argument("--embeddings_path", type=Path, required=True)
+    parser.add_argument("--embeddings_path", type=Path, default=None,
+                        help="Embeddings shard file (default: inferred from experiment "
+                             "as embeddings/layer_<N>/shard_<S>/activations.pt)")
     parser.add_argument("--experiment", type=str, default=None,
-                        help="Experiment name; creates Outputs/<experiment>_<ts>/")
+                        help="Experiment name; routes outputs into Outputs/<experiment>/")
     parser.add_argument("--exp_dir", type=Path, default=None,
                         help="Reuse an existing experiment directory")
     parser.add_argument("--output_dir", type=Path, default=None,
                         help="Explicit output dir (overrides experiment routing)")
+    parser.add_argument("--layer", type=int, default=6,
+                        help="Embedding layer (for inferred embeddings_path)")
+    parser.add_argument("--shard", type=int, default=0,
+                        help="Embedding shard (for inferred embeddings_path)")
+    parser.add_argument("--max_length", type=int, default=512,
+                        help="Embedder max_length used at extraction (boundaries truncated "
+                             "to max_length-2)")
     parser.add_argument("--sequences_csv", type=Path, default=None)
     parser.add_argument("--sequence_column", type=str, default="sequence")
     parser.add_argument("--label_column", type=str, default=None)

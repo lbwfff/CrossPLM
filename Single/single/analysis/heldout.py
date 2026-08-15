@@ -45,14 +45,33 @@ def select_top_feature_per_concept(df_valid: pd.DataFrame) -> pd.DataFrame:
 def evaluate_heldout(df_test: pd.DataFrame, selected: pd.DataFrame) -> pd.DataFrame:
     """
     Evaluate selected (feature, concept) pairs on the held-out test set.
-    Returns the test metrics for those pairs only.
+
+    Uses a LEFT join so that every pair selected on the validation split appears
+    in the result. Pairs absent from the test CSV (because align_features_to_concepts
+    only emits f1 > 0) are explicitly materialized with zero metrics — otherwise the
+    reported held-out average would be upward-biased by silently dropping the failures.
     """
+    # Metric columns present in the test CSV (excluding the join keys).
+    metric_cols = [c for c in df_test.columns if c not in ("feature", "concept")]
     merged = pd.merge(
+        selected,  # left: every selected pair
         df_test,
-        selected,
         on=["feature", "concept"],
-        how="inner",
+        how="left",
     )
+    # Fill missing metrics (test-F1 == 0 pairs) with zeros.
+    for col in metric_cols:
+        if col in merged.columns:
+            merged[col] = merged[col].fillna(0)
+
+    # For multi-shard test splits, the same (feature, concept) pair appears once
+    # per shard. Aggregate to one row per pair, keeping the best value of each
+    # metric (the strongest evidence across test shards).
+    if not merged.empty:
+        agg = merged.groupby(["feature", "concept"], as_index=False)[metric_cols].max()
+        # Preserve column order of the original test CSV.
+        cols = ["feature", "concept"] + metric_cols
+        return agg[cols]
     return merged
 
 

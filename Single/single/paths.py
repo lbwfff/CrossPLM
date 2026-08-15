@@ -3,7 +3,7 @@ Centralized output path management for the SAE interpretability pipeline.
 
 All scripts write into a single experiment directory:
 
-    Outputs/<experiment>_<timestamp>/
+    Outputs/<experiment>/
         embeddings/layer_<N>/shard_<i>/activations.pt
         sae/ae.pt
         concepts/shard_<i>/aa_concepts.npz
@@ -12,19 +12,19 @@ All scripts write into a single experiment directory:
 Usage:
     from single.paths import Experiment
 
-    exp = Experiment(name="swissprot")        # -> Outputs/swissprot_20260814_123000/
-    exp.embeddings_dir(layer=6)               # Outputs/.../embeddings/layer_6
-    exp.sae_dir                               # Outputs/.../sae
-    exp.concepts_dir                          # Outputs/.../concepts
-    exp.analysis_dir                          # Outputs/.../analysis
+    exp = Experiment(name="swissprot")        # -> Outputs/swissprot/
+    exp.embeddings_dir(layer=6)               # Outputs/swissprot/embeddings/layer_6
+    exp.sae_dir                               # Outputs/swissprot/sae
+    exp.concepts_dir                          # Outputs/swissprot/concepts
+    exp.analysis_dir                          # Outputs/swissprot/analysis
 
-Pass the experiment dir (exp.dir) between steps; each script re-resolves
-subdirectories from it. If you pass a name without timestamp, we create one.
-If you pass an existing dir, we reuse it as-is.
+The experiment name is used verbatim as the directory name (no timestamp), so a
+given `--experiment <name>` always routes to the SAME `Outputs/<name>/`. Re-running
+a step with the same name reuses the existing directory (e.g. overwriting ae.pt).
+Use distinct experiment names for distinct runs. `--exp_dir <path>` uses that path
+verbatim.
 """
 
-import datetime
-import re
 from pathlib import Path
 from typing import Optional
 
@@ -36,20 +36,20 @@ class Experiment:
         self,
         name: str,
         root: Path = Path("../Outputs"),
-        timestamp: Optional[str] = None,
     ):
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
-
-        # If name already looks like an experiment dir (contains a timestamp),
-        # reuse it; otherwise create name_timestamp.
-        if re.search(r"\d{8}_\d{6}$", str(name)):
-            self.dir = root / name
-        else:
-            if timestamp is None:
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.dir = root / f"{name}_{timestamp}"
+        # Use the experiment name verbatim as the directory name (no timestamp).
+        self.dir = root / name
         self.dir.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def from_existing_dir(cls, existing_dir: Path) -> "Experiment":
+        """Use an already-existing experiment directory verbatim (no root join)."""
+        self = cls.__new__(cls)
+        self.dir = Path(existing_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        return self
 
     # ---- subdirectories ----
     @property
@@ -112,10 +112,15 @@ def resolve_experiment(
 ) -> Experiment:
     """
     Build an Experiment from either an existing experiment directory or a name.
-    Priority: exp_dir (if given) > name (creates new timestamped dir).
+
+    - `name` -> `root/<name>` (no timestamp; same name always maps to the same dir).
+    - `exp_dir` -> used verbatim (NOT re-joined under `root`, so passing
+      `Outputs/foo` won't create `Outputs/Outputs/foo`).
+
+    Priority: exp_dir (if given) > name.
     """
     if exp_dir is not None:
-        return Experiment(name=str(exp_dir), root=root)
+        return Experiment.from_existing_dir(exp_dir)
     if name is None:
         raise ValueError("Must provide either exp_dir or experiment name")
     return Experiment(name=name, root=root)

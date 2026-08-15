@@ -34,7 +34,8 @@ def cmd_train(args):
 
     from crossplm import (
         TrainingConfig, TokenClassificationDataset, load_data_from_csv,
-        split_dataset, build_label_map, compute_class_weights, PLMModel, Trainer,
+        split_dataset, build_label_map, build_id2label, label_map_n_classes,
+        compute_class_weights, PLMModel, Trainer,
     )
 
     def set_seed(seed: int):
@@ -69,15 +70,36 @@ def cmd_train(args):
         print("ERROR: No valid data loaded. Check CSV path and column names.")
         sys.exit(1)
 
-    label_map = build_label_map(labels)
+    # Use an explicit label-map preset/YAML if configured (consistent with the
+    # interpretability module), otherwise infer from the CSV with sorted(unique).
+    label_map = None
+    if config.label_map:
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Single"))
+            from single.label_maps import get_label_map
+            spec = get_label_map(config.label_map)
+            label_map = dict(spec["mapping"])
+        except Exception as e:
+            print(f"  WARNING: could not load label_map '{config.label_map}': {e}")
+            print("  Falling back to inferring label map from CSV.")
+    if label_map is None:
+        label_map = build_label_map(labels)
     print(f"  Label map: {label_map}")
 
     print(f"[Loading backbone model] {config.backbone_model_id}")
+    n_classes = label_map_n_classes(label_map)
     plm = PLMModel(
         backbone_model_id=config.backbone_model_id,
         task_type=config.task_type,
-        num_labels=len(label_map),
+        num_labels=n_classes,
     )
+
+    # Persist the training-time label map into the model config so downstream
+    # evaluation can reuse the exact same label -> id mapping instead of
+    # rebuilding it from the eval CSV (which may have different characters).
+    # build_id2label dedupes by class id (many-to-one char maps like mBMRB).
+    plm.config.id2label = build_id2label(label_map)
+    plm.config.label2id = {c: i for c, i in label_map.items()}
 
     class_weights = compute_class_weights(labels, label_map, config.class_weight_method)
 
@@ -103,6 +125,7 @@ def cmd_train(args):
         eval_dataset=eval_dataset,
         task_dir=task_dir,
         class_weights=class_weights,
+        n_classes=n_classes,
     )
     trainer.train()
     print(f"[Done] -> {task_dir}")
@@ -114,7 +137,7 @@ def cmd_eval(args):
     from torch.utils.data import DataLoader
     from tqdm import tqdm
     from transformers import AutoModelForTokenClassification, AutoTokenizer
-    from crossplm.data.dataset import TokenClassificationDataset, load_data_from_csv, build_label_map
+    from crossplm.data.dataset import TokenClassificationDataset, load_data_from_csv, build_label_map, label_map_n_classes
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -122,8 +145,14 @@ def cmd_eval(args):
     csv_path = os.path.abspath(args.csv)
 
     print(f"[Loading checkpoint] {ckpt_path}")
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_path, local_files_only=True)
-    model = AutoModelForTokenClassification.from_pretrained(ckpt_path, local_files_only=True)
+    # The fine-tuned backbones (e.g. Synthyra/ESM2-8M via FastPLMs) ship custom
+    # code, so trust_remote_code=True is required to load their checkpoints.
+    tokenizer = AutoTokenizer.from_pretrained(
+        ckpt_path, local_files_only=True, trust_remote_code=True,
+    )
+    model = AutoModelForTokenClassification.from_pretrained(
+        ckpt_path, local_files_only=True, trust_remote_code=True,
+    )
     model.to(device)
     model.eval()
 
@@ -134,7 +163,26 @@ def cmd_eval(args):
     sequences, labels = load_data_from_csv(csv_path)
     print(f"  samples: {len(sequences)}")
 
-    label_map = build_label_map(labels)
+    # Prefer the training-time label map persisted in the checkpoint config.
+    # label2id is the complete {char: class_id} map (many chars may map to one
+    # class), so it is the correct source. id2label is only class_id -> a single
+    # representative char and is NOT sufficient to re-derive the full mapping.
+    # Fall back to rebuilding from the eval CSV only for legacy checkpoints.
+    cfg_label2id = getattr(model.config, "label2id", None)
+    # Guard against HF placeholder maps like {"LABEL_0":0, "LABEL_1":1}, which
+    # are auto-generated and are not the training-time mapping.
+    is_hf_placeholder = (
+        cfg_label2id is not None
+        and all(str(k).startswith("LABEL_") for k in cfg_label2id)
+    )
+    if cfg_label2id and not is_hf_placeholder and all(str(v) != "None" for v in cfg_label2id.values()):
+        label_map = {str(k): int(v) for k, v in cfg_label2id.items()}
+        print(f"  Label map (from checkpoint): {label_map}")
+    else:
+        label_map = build_label_map(labels)
+        print(f"  Label map (rebuilt from eval CSV): {label_map}")
+
+    n_classes = label_map_n_classes(label_map)
     dataset = TokenClassificationDataset(
         sequences=sequences, labels=labels, tokenizer=tokenizer,
         max_length=args.max_seq_length, label_map=label_map,
@@ -164,28 +212,47 @@ def cmd_eval(args):
             batch = {k: v.to(device) for k, v in batch.items()}
             logits = model(**batch).logits
             probs = torch.softmax(logits, dim=-1)
+            n_classes = probs.size(-1)
             for i in range(logits.size(0)):
                 mask = batch["labels"][i] != -100
                 all_preds.extend(logits[i][mask].argmax(dim=-1).cpu().tolist())
                 all_labels.extend(batch["labels"][i][mask].cpu().tolist())
-                all_probs.extend(probs[i][mask, 1].cpu().tolist())
+                all_probs.extend(probs[i][mask].cpu().tolist())  # keep ALL class probs
 
-    from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, precision_recall_curve, auc
+    from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 
+    # n_classes is computed above from label_map_n_classes(label_map).
     accuracy = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average="macro")
-    cm = confusion_matrix(all_labels, all_preds)
-    precision, recall, _ = precision_recall_curve(all_labels, all_probs, pos_label=1)
-    auprc = auc(recall, precision)
+    f1 = f1_score(all_labels, all_preds, average="macro", labels=list(range(n_classes)), zero_division=0)
+    cm = confusion_matrix(all_labels, all_preds, labels=list(range(n_classes)))
+
+    # AUPRC: macro-avg of per-class PR-AUC (handles binary and >2 classes).
+    # We also keep the last per-class (precision, recall) curves for plotting.
+    from sklearn.metrics import precision_recall_curve, auc
+    auprc = 0.0
+    per_class_pr = []  # list of (precision, recall) arrays for plotting
+    try:
+        for cls in range(n_classes):
+            y_bin = [1 if l == cls else 0 for l in all_labels]
+            p, r, _ = precision_recall_curve(y_bin, [prob[cls] for prob in all_probs])
+            auprc += auc(r, p)
+            per_class_pr.append((p, r))
+        auprc /= n_classes
+    except Exception as e:
+        print(f"  (AUPRC skipped: {e})")
+        auprc = 0.0
 
     print(f"\n  Accuracy:  {accuracy:.4f}")
     print(f"  F1 (macro): {f1:.4f}")
-    print(f"  AUPRC:      {auprc:.4f}")
-    print(f"\n  Confusion Matrix:               Pred 0   Pred 1")
-    print(f"                    Actual 0    {cm[0][0]:>7d}  {cm[0][1]:>7d}")
-    print(f"                    Actual 1    {cm[1][0]:>7d}  {cm[1][1]:>7d}")
+    print(f"  AUPRC (macro): {auprc:.4f}")
+    print(f"  Num classes: {n_classes}")
+    print("\n  Confusion Matrix (rows=actual, cols=pred):")
+    print("        " + " ".join(f"Pred{i:>5}" for i in range(n_classes)))
+    for i in range(n_classes):
+        print(f"  Act{i:>3}  " + " ".join(f"{cm[i][j]:>9d}" for j in range(n_classes)))
 
-    metrics = {"accuracy": round(accuracy, 4), "f1_macro": round(f1, 4), "auprc": round(auprc, 4),
+    metrics = {"accuracy": round(accuracy, 4), "f1_macro": round(f1, 4),
+               "auprc_macro": round(auprc, 4), "n_classes": n_classes,
                "confusion_matrix": cm.tolist(), "n_positions": len(all_labels),
                "checkpoint": args.checkpoint, "csv": args.csv}
 
@@ -205,29 +272,35 @@ def cmd_eval(args):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        plt.figure(figsize=(6, 5))
+        # Confusion matrix (supports any n_classes >= 1)
+        plt.figure(figsize=(max(4, 1.2 * n_classes), max(3, 1.0 * n_classes)))
         plt.imshow(cm, interpolation="nearest", cmap="Blues")
         plt.title("Confusion Matrix", fontsize=14)
         plt.colorbar()
-        for i in range(2):
-            for j in range(2):
+        cm_max = cm.max() if cm.size else 1
+        for i in range(n_classes):
+            for j in range(n_classes):
                 plt.text(j, i, format(cm[i, j], "d"), ha="center", va="center",
-                         color="white" if cm[i, j] > cm.max() / 2 else "black")
-        plt.xticks([0, 1], ["0", "1"], fontsize=12)
-        plt.yticks([0, 1], ["0", "1"], fontsize=12)
+                         color="white" if cm[i, j] > cm_max / 2 else "black")
+        tick_labels = [str(i) for i in range(n_classes)]
+        plt.xticks(range(n_classes), tick_labels, fontsize=12)
+        plt.yticks(range(n_classes), tick_labels, fontsize=12)
         plt.xlabel("Predicted", fontsize=13)
         plt.ylabel("True", fontsize=13)
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, "confusion_matrix.png"), dpi=150)
         plt.close()
 
+        # Precision-Recall curve: one curve per class (macro-AUPRC in legend)
         plt.figure(figsize=(7, 5))
-        plt.plot(recall, precision, linewidth=2, label=f"AUPRC = {auprc:.4f}")
-        plt.fill_between(recall, precision, alpha=0.15)
+        if per_class_pr:
+            for cls, (p, r) in enumerate(per_class_pr):
+                plt.plot(r, p, linewidth=1.5, label=f"class {cls}")
+            plt.plot([], [], " ", label=f"macro-AUPRC = {auprc:.4f}")
         plt.xlabel("Recall", fontsize=13)
         plt.ylabel("Precision", fontsize=13)
         plt.title("Precision-Recall Curve", fontsize=14)
-        plt.legend(fontsize=12)
+        plt.legend(fontsize=11)
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, "auprc_curve.png"), dpi=150)

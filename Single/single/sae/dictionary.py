@@ -147,11 +147,12 @@ class TopKSAE(Dictionary):
     def decode(self, f):
         return self.decoder(f) + self.b_dec
 
-    def forward(self, x, output_features=False):
+    def forward(self, x, output_features=False, unnormalize=False):
         x, original_norms = self._normalize_input_and_get_norms(x)
         f = self.encode(x)
         x_hat = self.decode(f)
-        x_hat = self._unnormalize_output(x_hat, original_norms)
+        if unnormalize:
+            x_hat = self._unnormalize_output(x_hat, original_norms)
         if output_features:
             return x_hat, f
         return x_hat

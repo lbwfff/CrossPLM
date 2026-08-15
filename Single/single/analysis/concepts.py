@@ -32,12 +32,18 @@ import pandas as pd
 from scipy import sparse
 
 # Feature table column names in UniProtKB TSV
+# NOTE on categorization:
+# - "Signal peptide" is BINARY: its cells are "SIGNAL 1..17; /evidence=..." with
+#   no subcategory field, so parsing it as categorical drops every entry.
+# - "Cofactor" is a PROTEIN-level annotation ("COFACTOR: Name=Mg(2+); ...") with
+#   no residue position, so it cannot be expanded to residues here at all.
 CATEGORICAL_CONCEPTS = [
-    "Active site", "Binding site", "Cofactor", "Glycosylation",
+    "Active site", "Binding site", "Glycosylation",
     "Modified residue", "Transit peptide", "Compositional bias",
-    "Domain [FT]", "Region", "Zinc finger", "Motif", "Signal peptide",
+    "Domain [FT]", "Region", "Zinc finger", "Motif",
 ]
-BINARY_CONCEPTS = ["Turn", "Helix", "Beta strand", "Coiled coil", "Lipidation"]
+BINARY_CONCEPTS = ["Turn", "Helix", "Beta strand", "Coiled coil", "Lipidation",
+                   "Signal peptide"]
 INTERACTION_CONCEPTS = ["Disulfide bond"]
 
 # TSV column name -> UniProt Feature-table prefix (fixed abbreviations)
@@ -151,14 +157,21 @@ def _process_categorical(column_data, column_name, category_options, seq_len):
 
     entries = column_data.split(f"{column_name} ")[1:]
     for entry in entries:
+        # Only look at this annotation's own segment: everything up to the next
+        # occurrence of the prefix (or end of cell). Searching the whole chunk
+        # can leak a LATER annotation's /note into an earlier entry that lacks one.
+        next_prefix = entry.find(f"{column_name} ", 1)
+        segment = entry if next_prefix == -1 else entry[:next_prefix]
+
         # Try each annotation field type
         subcategory = None
         for field_re in _ANNOT_FIELDS:
-            match = re.search(field_re, entry)
+            match = re.search(field_re, segment)
             if match:
                 subcategory = match.group(1).split(";")[0]
                 break
         if subcategory is None:
+            # No subcategory -> not categorical; skip (binary-style entry).
             continue
 
         # Normalize subcategory name
@@ -166,7 +179,7 @@ def _process_categorical(column_data, column_name, category_options, seq_len):
         if cat not in category_options:
             continue
 
-        positions = entry.split(";")[0]
+        positions = segment.split(";")[0]
         idxs = _parse_position(positions)
         if idxs is None:
             continue
@@ -197,10 +210,15 @@ def compute_categorical_options(df: pd.DataFrame) -> Dict[str, set]:
         if col in df.columns:
             for value in df[col].dropna():
                 for entry in str(value).split(f"{col_name} ")[1:]:
-                    match = re.search(r'/note="([^"]+)"', entry)
-                    if match:
-                        note = match.group(1).split(";")[0]
-                        options.add(note.lower().replace(" ", "_").replace("-", "_"))
+                    # Use the SAME annotation fields as _process_categorical
+                    # (/note, /ligand, /description, /cofactor) so the options
+                    # collected here match what the parser will look for.
+                    for field_re in _ANNOT_FIELDS:
+                        match = re.search(field_re, entry)
+                        if match:
+                            sub = match.group(1).split(";")[0]
+                            options.add(sub.lower().replace(" ", "_").replace("-", "_"))
+                            break
         options = set(options) | {"any"}
         categorical_options[col] = options
     return categorical_options
@@ -209,6 +227,7 @@ def compute_categorical_options(df: pd.DataFrame) -> Dict[str, set]:
 def expand_annotations_to_residues(
     df: pd.DataFrame,
     categorical_options: Optional[Dict[str, set]] = None,
+    max_residues: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     Expand protein-level UniProt annotation columns to per-residue concept columns.
@@ -218,6 +237,9 @@ def expand_annotations_to_residues(
         categorical_options: optional precomputed options (from
             compute_categorical_options on the full dataset). If None, computed
             from this df (shard-local, may cause column mismatch across shards).
+        max_residues: optional cap on residues per protein. MUST match the
+            embedder's truncation (max_length - 2) so concept rows align with
+            embedding tokens. If None, the full sequence is used (default).
 
     Returns:
         df: DataFrame with one row per amino acid, columns include:
@@ -226,12 +248,16 @@ def expand_annotations_to_residues(
     """
     new_columns = {}
 
+    def _per_residue_len(seq: str) -> int:
+        """Residues kept per protein, matching the embedder's truncation."""
+        return min(len(seq), max_residues) if max_residues is not None else len(seq)
+
     # Binary concepts
     for col in BINARY_CONCEPTS:
         col_name = column_to_prefix(col)
         concept_cols = []
         for _, row in df.iterrows():
-            indices = _process_binary(row[col], col_name, len(row["Sequence"]))
+            indices = _process_binary(row[col], col_name, _per_residue_len(str(row["Sequence"])))
             concept_cols.append(indices)
         new_columns[col] = concept_cols
 
@@ -240,7 +266,7 @@ def expand_annotations_to_residues(
         col_name = column_to_prefix(col)
         concept_cols = []
         for _, row in df.iterrows():
-            indices = _process_interaction(row[col], col_name, len(row["Sequence"]))
+            indices = _process_interaction(row[col], col_name, _per_residue_len(str(row["Sequence"])))
             concept_cols.append(indices)
         new_columns[col] = concept_cols
 
@@ -252,17 +278,18 @@ def expand_annotations_to_residues(
         # Build per-category residue indices
         cat_columns = {f"{col}_{cat}": [] for cat in options}
         for _, row in df.iterrows():
-            cat_indices = _process_categorical(row[col], col_name, options, len(row["Sequence"]))
+            cat_indices = _process_categorical(row[col], col_name, options,
+                                               _per_residue_len(str(row["Sequence"])))
             for cat in options:
                 cat_columns[f"{col}_{cat}"].append(cat_indices[cat])
         for concept_name, concept_lists in cat_columns.items():
             new_columns[concept_name] = concept_lists
 
-    # Build residue-level dataframe
+    # Build residue-level dataframe (truncated to max_residues per protein).
     rows = []
     for idx, row in df.iterrows():
         seq = str(row["Sequence"])
-        for pos in range(len(seq)):
+        for pos in range(_per_residue_len(seq)):
             rows.append({"Entry": row["Entry"], "amino_acid": seq[pos], "position": pos})
     result = pd.DataFrame(rows)
 
@@ -296,6 +323,7 @@ def build_concept_matrix(
     n_shards: int = 5,
     min_seq_len: int = 30,
     max_seq_len: int = 1022,
+    max_residues: Optional[int] = None,
 ):
     """
     Convert a UniProtKB TSV into sharded per-residue sparse concept matrices.
@@ -305,6 +333,9 @@ def build_concept_matrix(
                          feature-table columns (Helix, Domain [FT], etc.)
         output_dir: where to write shard_N/aa_concepts.npz + metadata
         n_shards: number of shards to split proteins into
+        max_residues: residues kept per protein. MUST equal the embedder's
+            truncation (embedder max_length - 2) so concept rows align with
+            embedding tokens. If None, full sequences are used (legacy).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -329,17 +360,34 @@ def build_concept_matrix(
     for shard_id, shard_df in enumerate(shards):
         print(f"Processing shard {shard_id}/{n_shards} ({len(shard_df)} proteins)...")
         residue_df, concept_columns = expand_annotations_to_residues(
-            shard_df, categorical_options=global_options,
+            shard_df, categorical_options=global_options, max_residues=max_residues,
         )
 
-        # Build sparse matrix (int32: holds domain instance indices, not just 0/1)
+        # Build sparse matrix directly from the per-concept residue lists using COO,
+        # avoiding a dense [n_residues, n_concepts] intermediate (which can be many
+        # GB for large shards). Values are domain-instance indices (>0), 0 = absent.
         n_residues = len(residue_df)
         n_concepts = len(concept_columns)
-        matrix = np.zeros((n_residues, n_concepts), dtype=np.int64)
+        rows, cols, data = [], [], []
         for j, concept in enumerate(concept_columns):
-            matrix[:, j] = residue_df[concept].values
+            vals = residue_df[concept].values
+            nz = np.nonzero(vals)[0]
+            if nz.size:
+                rows.append(nz)
+                cols.append(np.full(nz.size, j, dtype=np.int64))
+                data.append(vals[nz])
+        if rows:
+            rows = np.concatenate(rows)
+            cols = np.concatenate(cols)
+            data = np.concatenate(data)
+        else:
+            rows = np.empty(0, dtype=np.int64)
+            cols = np.empty(0, dtype=np.int64)
+            data = np.empty(0, dtype=np.int64)
 
-        sparse_mat = sparse.csr_matrix(matrix)
+        sparse_mat = sparse.csr_matrix((data, (rows, cols)),
+                                       shape=(n_residues, n_concepts),
+                                       dtype=np.int64)
         shard_dir = output_dir / f"shard_{shard_id}"
         shard_dir.mkdir(parents=True, exist_ok=True)
         sparse.save_npz(shard_dir / "aa_concepts.npz", sparse_mat)

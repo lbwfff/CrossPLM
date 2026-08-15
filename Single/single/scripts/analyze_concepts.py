@@ -41,6 +41,7 @@ def cmd_build(
     n_shards: int = 5,
     min_seq_len: int = 30,
     max_seq_len: int = 1022,
+    max_residues: Optional[int] = None,
 ):
     from single.analysis.concepts import build_concept_matrix
     from single.paths import resolve_experiment
@@ -55,6 +56,7 @@ def cmd_build(
         n_shards=n_shards,
         min_seq_len=min_seq_len,
         max_seq_len=max_seq_len,
+        max_residues=max_residues,
     )
 
 
@@ -332,6 +334,10 @@ def main():
     p_build.add_argument("--n_shards", type=int, default=5)
     p_build.add_argument("--min_seq_len", type=int, default=30)
     p_build.add_argument("--max_seq_len", type=int, default=1022)
+    p_build.add_argument("--max_residues", type=int, default=None,
+                         help="Residues kept per protein (must equal embedder "
+                              "max_length - 2, e.g. 510 for max_length=512) so "
+                              "concept rows align with embedding tokens")
 
     # align
     p_align = sub.add_parser("align", help="Align SAE features to concepts")
@@ -393,7 +399,8 @@ def main():
     args = parser.parse_args()
     if args.command == "build":
         cmd_build(args.annotations_tsv, args.concepts_dir, args.experiment,
-                  args.exp_dir, args.n_shards, args.min_seq_len, args.max_seq_len)
+                  args.exp_dir, args.n_shards, args.min_seq_len, args.max_seq_len,
+                  args.max_residues)
     elif args.command == "heldout":
         cmd_heldout(args.sae_dir, args.embeddings_dir, args.concepts_dir,
                     args.output_dir, args.experiment, args.exp_dir,

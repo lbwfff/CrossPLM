@@ -15,6 +15,31 @@ def build_label_map(labels: List[str]) -> Dict[str, int]:
     return {lbl: i for i, lbl in enumerate(sorted(unique))}
 
 
+def label_map_n_classes(label_map: Dict[str, int]) -> int:
+    """Number of distinct classes in a {char: class_id} label map.
+
+    Several characters may map to the same class id (e.g. mBMRB 'A' and '0'
+    both -> 0), so the class count is max(id) + 1, NOT len(label_map).
+    """
+    if not label_map:
+        return 0
+    return max(label_map.values()) + 1
+
+
+def build_id2label(label_map: Dict[str, int]) -> Dict[str, str]:
+    """Build config.id2label (class_id -> representative char) from a {char: id} map.
+
+    Deduplicates by class id so that many-to-one mappings (e.g. {'A':0, '0':0})
+    do not produce duplicate keys. The representative char is the lexicographically
+    smallest char for that class (matches build_label_map's sorted order).
+    """
+    by_class: Dict[int, str] = {}
+    for ch, cid in label_map.items():
+        if cid not in by_class or ch < by_class[cid]:
+            by_class[cid] = ch
+    return {str(cid): ch for cid, ch in sorted(by_class.items())}
+
+
 class TokenClassificationDataset(Dataset):
     def __init__(
         self,
@@ -67,7 +92,9 @@ class TokenClassificationDataset(Dataset):
                 cleaned = token.replace(" ", "").replace("▁", "")
                 if seq_idx < len(label_str):
                     ch = label_str[seq_idx]
-                    if ch == IGNORE_CHAR:
+                    # Unknown characters (e.g. a residue not seen in training)
+                    # are ignored, consistent with Single's encode_label_string.
+                    if ch == IGNORE_CHAR or ch not in self.label_map:
                         label_ids.append(-100)
                     else:
                         label_ids.append(self.label_map[ch])
@@ -82,15 +109,15 @@ def compute_class_weights(
     label_map: Dict[str, int],
     method: str = "inverse",
 ) -> torch.Tensor:
-    counts = [0] * len(label_map)
+    n_classes = label_map_n_classes(label_map)
+    counts = [0] * n_classes
     for label_str in labels:
         for ch in label_str:
-            if ch == IGNORE_CHAR:
+            if ch == IGNORE_CHAR or ch not in label_map:
                 continue
             counts[label_map[ch]] += 1
 
     total = sum(counts)
-    n_classes = len(counts)
 
     if method == "none":
         weights = [1.0] * n_classes

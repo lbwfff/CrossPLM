@@ -33,7 +33,7 @@ CrossPLM/
 │       ├── analysis/            # Feature-to-label & feature-to-concept alignment
 │       └── scripts/             # CLI scripts
 ├── Outputs/                     # Per-experiment output trees
-│   └── <experiment>_<ts>/       # embeddings / sae / concepts / analysis
+│   └── <experiment>/            # embeddings / sae / concepts / analysis
 └── README.md
 ```
 
@@ -111,7 +111,7 @@ experiment name (or reuse one with `--exp_dir`) and every step routes its
 output into the same tree:
 
 ```
-Outputs/<experiment>_<timestamp>/
+Outputs/<experiment>/
     embeddings/layer_<N>/shard_<i>/activations.pt
     sae/ae.pt
     concepts/shard_<i>/aa_concepts.npz
@@ -121,38 +121,54 @@ Outputs/<experiment>_<timestamp>/
 ```bash
 cd Single
 
-# 1. Extract hidden states from fine-tuned model (creates Outputs/mb_<ts>/)
+# 1. Extract hidden states from fine-tuned model (creates Outputs/mb/)
 python -m single.scripts.extract_embeddings \
     --ckpt_path ../Training/outputs/tasks/my_task/checkpoints/best \
     --sequences_csv ../Dataset/mBMRB.csv \
     --experiment mb \
     --label_column label --label_map mBMRB
 
-# 2. Train SAE (320-dim → 640 sparse features)
+# 2. Train SAE (320-dim → 640 sparse features; embeddings_dir inferred from experiment,
+#    uses ALL shards by default. --shard N restricts to one shard.)
 python -m single.scripts.train_sae \
-    --embeddings_dir ../Outputs/mb_*/embeddings/layer_6/shard_0 \
     --experiment mb \
-    --batch_size 64 --dict_size 640 --steps 10000 --l1_penalty 0.03
+    --batch_size 64 --dict_size 640 --steps 20000 --l1_penalty 0.08 \
+    --resample_steps 2000
 
 # 3. Align features with task labels
 python -m single.scripts.analyze_features \
-    --sae_dir ../Outputs/mb_*/sae \
-    --embeddings_dir ../Outputs/mb_*/embeddings/layer_6 \
+    --sae_dir ../Outputs/mb/sae \
+    --embeddings_dir ../Outputs/mb/embeddings/layer_6 \
     --experiment mb \
     --sequences_csv ../Dataset/mBMRB.csv --label_column label --label_map mBMRB
 
-# 4. Visualize top features on sequences
+# 4. Visualize top features on sequences (embeddings_path inferred from experiment)
 python -m single.scripts.visualize_features \
-    --sae_dir ../Outputs/mb_*/sae \
-    --embeddings_path ../Outputs/mb_*/embeddings/layer_6/shard_0/activations.pt \
-    --experiment mb --feature_indices 234 426 --label_map mBMRB
+    --sae_dir ../Outputs/mb/sae \
+    --experiment mb \
+    --sequences_csv ../Dataset/mBMRB.csv \
+    --feature_indices 234 426 --label_map mBMRB
 ```
 
-Note: `--experiment <name>` creates a fresh `Outputs/<name>_<ts>/` on first use.
-To continue the same run, pass `--exp_dir <existing_dir>` instead (or reuse the
-same `--experiment` name, which reuses the dir if the name already carries a
-timestamp). Any `--output_dir`/`--save_dir`/`--concepts_dir` explicitly given
-overrides the experiment routing.
+`visualize_features` 默认从实验目录推断嵌入文件
+`Outputs/<exp>/embeddings/layer_<N>/shard_<S>/activations.pt`（`--layer` 默认 6，`--shard` 默认 0）。
+如需指定其它 shard，加 `--shard 1`；也可用 `--embeddings_path <file>` 显式覆盖。
+它会按 `--experiment` 重新对 CSV 做与提取时相同的打乱+分片（`sample(frac=1, random_state=42)`），
+确保展示的蛋白与其嵌入、标签严格对齐，并输出 PNG 到 `Outputs/<exp>/analysis/visualizations/`。
+
+`train_sae` 同样默认从实验目录推断嵌入（`Outputs/<exp>/embeddings/layer_<N>`，含全部 shard），
+可用 `--embeddings_dir` 覆盖；`--shard N` 只训练单个 shard。常用调参提示：
+- `--l1_penalty` 控制稀疏度（约 0.06–0.1），值越大特征越稀疏（l0 越低）但重构损失越高
+- `--resample_steps N` 周期性复活"死特征"（从不激活的特征），可降低 `dead_pct`
+- 理想目标：**l0 在 20–80、dead_pct < 30%、recon_loss 尽量低**
+
+Note: `--experiment <name>` routes all outputs into `Outputs/<name>/` — the name
+is used **verbatim (no timestamp)**, so every step of the same experiment shares
+one directory. Re-running a step with the same name reuses that directory (e.g.
+overwrites `ae.pt`). Use **distinct experiment names** for distinct runs. Pass
+`--exp_dir <existing_dir>` to point at an existing experiment directory directly.
+Any `--output_dir`/`--save_dir`/`--concepts_dir` explicitly given overrides the
+experiment routing.
 
 ### Example Output
 
@@ -188,7 +204,11 @@ datasets with different label formats without changing any code.
 |--------|---------------|-------------|-------------------|
 | `mBMRB` | 1 | rigid / flexible | `A→0`, `.→1`, `0→0`, `1→1` |
 | `relaxdb` | 1 | static / mobile | `p/A/v→0`, `./b/^→1` |
-| `ss3` | 1 | helix / strand / coil | `H→0`, `E→1`, `C→2` (3-class) |
+| `ss3` | 1 | coil / strand / helix | `C→0`, `E→1`, `H→2` (3-class) |
+
+> The `ss3` ids follow the training module's `build_label_map` (`sorted(unique)`,
+> i.e. `C < E < H`), so a model trained with an inferred label map evaluates
+> consistently with this preset.
 
 Use a preset by name:
 ```bash
@@ -236,24 +256,31 @@ Download from UniProt with a query like: `reviewed:true` → Export → TSV.
 python -m single.scripts.analyze_concepts build \
     --annotations_tsv ../Dataset/uniprotkb_swissprot.tsv \
     --experiment sp \
-    --n_shards 5
+    --n_shards 5 \
+    --max_residues 510   # must equal embedder max_length - 2 (default 512 -> 510)
 ```
 
 This expands each protein-level annotation to amino-acid level and saves
 `shard_N/aa_concepts.npz` (sparse matrices) + `aa_concepts_columns.txt` (concept names)
-into `Outputs/sp_*/concepts/`.
+into `Outputs/sp/concepts/`.
+
+> **Alignment requirement:** pass `--max_residues` (embedder `max_length` − 2, e.g.
+> 510 for the default 512) so concept rows cover exactly the same residues the
+> embedder keeps. Sequences longer than this are truncated identically on both
+> sides; without it, concept matrices use the full-length sequence and can misalign
+> with truncated embeddings.
 
 **Step 2: Align SAE features to concepts.**
 
 ```bash
 python -m single.scripts.analyze_concepts align \
-    --sae_dir ../Outputs/sp_*/sae \
-    --embeddings_dir ../Outputs/sp_*/embeddings/layer_6 \
+    --sae_dir ../Outputs/sp/sae \
+    --embeddings_dir ../Outputs/sp/embeddings/layer_6 \
     --experiment sp \
     --threshold_percents 0 0.15 0.5 0.6 0.8
 ```
 
-Concepts and output are routed into `Outputs/sp_*/` automatically. Note that the
+Concepts and output are routed into `Outputs/sp/` automatically. Note that the
 **embeddings must be extracted from the same TSV** (same `--n_shards`) so embedding
 and concept shards are token-aligned.
 
@@ -290,8 +317,8 @@ from evaluation:
 
 ```bash
 python -m single.scripts.analyze_concepts heldout \
-    --sae_dir ../Outputs/sp_*/sae \
-    --embeddings_dir ../Outputs/sp_*/embeddings/layer_6 \
+    --sae_dir ../Outputs/sp/sae \
+    --embeddings_dir ../Outputs/sp/embeddings/layer_6 \
     --experiment sp \
     --split_mode half \
     --threshold_percents 0 0.15 0.5 0.6 0.8
@@ -342,7 +369,7 @@ Loss_Recovered = 1 - (ce_sae - ce_orig) / (ce_zero - ce_orig)
 python -m single.scripts.evaluate_fidelity \
     --ckpt_path ../Training/outputs/tasks/my_task/checkpoints/best \
     --sequences_csv ../Dataset/mBMRB.csv \
-    --sae_dir ../Outputs/sp_*/sae \
+    --sae_dir ../Outputs/sp/sae \
     --experiment sp \
     --layer 6 --label_column label --label_map mBMRB
 ```
@@ -475,12 +502,12 @@ cd Single && pip install -e .
 
 ## Output Structure
 
-Every step of the pipeline writes into one **experiment directory** (created on
-first use via `--experiment <name>`; reuse with `--exp_dir`):
+Every step of the pipeline writes into one **experiment directory** (named by
+`--experiment <name>`, verbatim with no timestamp; reuse with `--exp_dir`):
 
 ```
 Outputs/
-└── <experiment>_<timestamp>/
+└── <experiment>/
     ├── embeddings/
     │   └── layer_<N>/                # Per-residue hidden states
     │       ├── shard_0/activations.pt
