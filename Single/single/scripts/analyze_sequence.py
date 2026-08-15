@@ -17,6 +17,15 @@ Usage:
         --feature_indices 375 42 234
 """
 
+import os
+import sys
+
+# Allow running directly from the repository root, e.g.
+#   python Single/single/scripts/analyze_sequence.py ...
+# without `cd Single` or installing the package (the `single` package lives at
+# Single/single/, two levels up from this file).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
 import argparse
 import json
 from pathlib import Path
@@ -36,7 +45,6 @@ from single.analysis.sequence import (
 
 
 def analyze(
-    sae_dir: Path,
     embeddings_dir: Path,
     sequences_csv: Path,
     feature_indices: List[int],
@@ -49,11 +57,20 @@ def analyze(
     max_length: int = 512,
     flank: int = 3,
     activation_threshold: float = 0.0,
+    min_seq_len: int = 0,
+    max_seq_len: int = 10_000,
+    sae_dir: Optional[Path] = None,
 ):
     from single.paths import resolve_experiment
 
-    if output_dir is None:
+    # --sae_dir and --output_dir default into Outputs/<experiment>/.
+    exp = None
+    if sae_dir is None or output_dir is None:
         exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+    if sae_dir is None:
+        sae_dir = exp.sae_dir
+        print(f"  SAE dir (inferred): {sae_dir}")
+    if output_dir is None:
         output_dir = exp.analysis_dir
         print(f"Experiment dir: {exp.dir}")
     output_dir = Path(output_dir)
@@ -75,9 +92,9 @@ def analyze(
             raise ValueError(f"feature_idx {f} out of range [0, {sae.dict_size})")
 
     # Load embeddings for the requested shard
-    emb_path = Path(embeddings_dir) / f"shard_{shard}" / "activations.pt"
+    emb_path = Path(embeddings_dir) / f"shard_{shard}" / "embeddings.pt"
     if not emb_path.exists():
-        cands = sorted(Path(embeddings_dir).glob(f"shard_{shard}/**/activations.pt"))
+        cands = sorted(Path(embeddings_dir).glob(f"shard_{shard}/**/embeddings.pt"))
         if not cands:
             raise FileNotFoundError(f"No embeddings found for shard {shard} in {embeddings_dir}")
         emb_path = cands[0]
@@ -93,6 +110,7 @@ def analyze(
     print(f"\nRebuilding protein/residue mapping from {sequences_csv}...")
     df, shard_proteins, shard_respos = build_residue_positions(
         sequences_csv, [shard], n_shards=n_shards, max_residues=max_residues,
+        min_seq_len=min_seq_len, max_seq_len=max_seq_len,
     )
     protein_ids = shard_proteins[shard]
     respos = shard_respos[shard]
@@ -132,11 +150,11 @@ def analyze(
         cluster_label = "clustered (local)" if d < -0.1 else ("dispersed" if d > 0.1 else "~random")
         print(f"  Sequential Cohen's d: {d:+.3f}  → {cluster_label}")
 
-        # 2) Motif enrichment (reuse the same activation mask)
-        active_t = torch.from_numpy(active_np)
+        # 2) Motif enrichment (reuse the already-computed activation mask)
         motif = motif_enrichment(
             sae, embeddings, proteins, protein_ids, respos, fidx,
             flank=flank, activation_threshold=activation_threshold, device=device,
+            active_mask=active_np,
         )
         top = summarize_motif(motif, top_n=5)
         print(f"  Active residues: {motif['n_active_residues']}")
@@ -161,7 +179,8 @@ def analyze(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sequence-level SAE feature analysis")
-    parser.add_argument("--sae_dir", type=Path, required=True)
+    parser.add_argument("--sae_dir", type=Path, default=None,
+                        help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     parser.add_argument("--embeddings_dir", type=Path, required=True)
     parser.add_argument("--sequences_csv", type=Path, required=True)
     parser.add_argument("--feature_indices", type=int, nargs="+", required=True)
@@ -175,5 +194,9 @@ if __name__ == "__main__":
     parser.add_argument("--flank", type=int, default=3,
                         help="Window radius around each activated residue for motif enrichment")
     parser.add_argument("--activation_threshold", type=float, default=0.0)
+    parser.add_argument("--min_seq_len", type=int, default=0,
+                        help="Must match extract_embeddings --min_seq_len")
+    parser.add_argument("--max_seq_len", type=int, default=10000,
+                        help="Must match extract_embeddings --max_seq_len")
     args = parser.parse_args()
     analyze(**vars(args))

@@ -331,7 +331,7 @@ def build_concept_matrix(
     Args:
         annotations_tsv: UniProtKB export TSV with 'Entry', 'Sequence', and
                          feature-table columns (Helix, Domain [FT], etc.)
-        output_dir: where to write shard_N/aa_concepts.npz + metadata
+        output_dir: where to write shard_N/concept_matrix.npz + metadata
         n_shards: number of shards to split proteins into
         max_residues: residues kept per protein. MUST equal the embedder's
             truncation (embedder max_length - 2) so concept rows align with
@@ -350,11 +350,10 @@ def build_concept_matrix(
     print("Computing global categorical options...")
     global_options = compute_categorical_options(df)
 
-    # Split into shards
-    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-    shard_size = int(np.ceil(len(df) / n_shards))
-    shards = [df.iloc[i:i + shard_size].reset_index(drop=True)
-              for i in range(0, len(df), shard_size)]
+    # Split into shards using the shared fixed-seed shuffle+shard (same ordering
+    # as extract_embeddings) so concept shards align with embedding shards.
+    from single.data import shuffled_shards
+    shards = shuffled_shards(df, n_shards)
 
     all_concept_columns = None
     for shard_id, shard_df in enumerate(shards):
@@ -390,7 +389,7 @@ def build_concept_matrix(
                                        dtype=np.int64)
         shard_dir = output_dir / f"shard_{shard_id}"
         shard_dir.mkdir(parents=True, exist_ok=True)
-        sparse.save_npz(shard_dir / "aa_concepts.npz", sparse_mat)
+        sparse.save_npz(shard_dir / "concept_matrix.npz", sparse_mat)
 
         # Save positive domain counts per concept (unique instance indices)
         n_domains = count_domains_per_concept(sparse_mat)
@@ -398,12 +397,12 @@ def build_concept_matrix(
 
         # Save residue metadata
         residue_df[["Entry", "amino_acid", "position"]].to_csv(
-            shard_dir / "aa_metadata.csv", index=False
+            shard_dir / "residues.csv", index=False
         )
 
         if all_concept_columns is None:
             all_concept_columns = concept_columns
-            (output_dir / "aa_concepts_columns.txt").write_text(
+            (output_dir / "concept_columns.txt").write_text(
                 "\n".join(concept_columns)
             )
 
@@ -415,8 +414,8 @@ def build_concept_matrix(
 def load_concept_shards(concepts_dir: Path, shard: int):
     """Load concept matrix and metadata for a shard."""
     shard_dir = Path(concepts_dir) / f"shard_{shard}"
-    matrix = sparse.load_npz(shard_dir / "aa_concepts.npz")
-    metadata = pd.read_csv(shard_dir / "aa_metadata.csv")
+    matrix = sparse.load_npz(shard_dir / "concept_matrix.npz")
+    metadata = pd.read_csv(shard_dir / "residues.csv")
     return matrix, metadata
 
 
@@ -439,7 +438,7 @@ def count_domains_per_concept(concept_matrix) -> np.ndarray:
 
 
 def load_concept_names(concepts_dir: Path) -> List[str]:
-    names_path = Path(concepts_dir) / "aa_concepts_columns.txt"
+    names_path = Path(concepts_dir) / "concept_columns.txt"
     if names_path.exists():
         return names_path.read_text().strip().split("\n")
     return []

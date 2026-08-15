@@ -45,52 +45,11 @@ AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
 # ---------------------------------------------------------------------------
 # Token -> (protein, residue index) mapping
 #
-# extract_embeddings.py shuffles the CSV (sample(frac=1, random_state=42)) then
-# splits into shards. We replicate that exact order so each embedding token can
-# be mapped back to (protein, residue-position-in-protein).
+# The shuffle+shard logic is centralized in single.data.build_residue_positions
+# (identical to extract_embeddings). We re-export it here for convenience.
 # ---------------------------------------------------------------------------
 
-def build_residue_positions(
-    sequences_csv: str,
-    shard_ids: List[int],
-    n_shards: int = 5,
-    max_residues: int = 510,
-    sequence_column: str = "sequence",
-) -> Tuple[List[str], Dict[int, np.ndarray]]:
-    """
-    Rebuild the per-shard token -> (protein, residue) mapping.
-
-    Returns:
-        shard_proteins: for each shard, list of (protein_index) per token
-        shard_respos: for each shard, array of residue position within protein
-    """
-    import re
-
-    df = pd.read_csv(sequences_csv, sep=None, engine="python")
-    if sequence_column not in df.columns:
-        raise ValueError(f"'{sequence_column}' column not found in {sequences_csv}")
-    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-
-    shard_size = int(np.ceil(len(df) / n_shards))
-    shards = [df.iloc[i:i + shard_size].reset_index(drop=True)
-              for i in range(0, len(df), shard_size)]
-
-    shard_proteins: Dict[int, List[int]] = {}
-    shard_respos: Dict[int, List[int]] = {}
-    for sid in shard_ids:
-        if sid >= len(shards):
-            raise ValueError(f"shard {sid} out of range (0-{len(shards)-1})")
-        proteins: List[int] = []
-        respos: List[int] = []
-        shard_df = shards[sid]
-        for prot_idx, seq in enumerate(shard_df[sequence_column].astype(str)):
-            seq_len = min(len(seq), max_residues)
-            proteins.extend([prot_idx] * seq_len)
-            respos.extend(range(seq_len))
-        shard_proteins[sid] = proteins
-        shard_respos[sid] = np.array(respos, dtype=np.int64)
-    return df, shard_proteins, shard_respos
-
+from single.data import build_residue_positions  # noqa: E402
 
 def feature_activation_positions(
     sae: Dictionary,
@@ -218,6 +177,7 @@ def motif_enrichment(
     activation_threshold: float = 0.0,
     batch_size: int = 4096,
     device: str = "cpu",
+    active_mask: Optional[np.ndarray] = None,
 ) -> Dict:
     """
     Compute amino-acid enrichment in a window around the feature's activated residues.
@@ -229,6 +189,8 @@ def motif_enrichment(
         respos: residue position per token
         feature_idx: feature to examine
         flank: window radius around each activated residue
+        active_mask: optional precomputed boolean [n_tokens] activation mask. If
+            provided, avoids re-running the SAE encode (caller already computed it).
 
     Returns:
         dict with:
@@ -236,10 +198,15 @@ def motif_enrichment(
           'n_active_residues': count of activated residues
           'flank': window radius used
     """
-    active = feature_activation_positions(
-        sae, embeddings, protein_ids, respos, feature_idx,
-        activation_threshold=activation_threshold, device=device,
-    )
+    # Reuse a precomputed activation mask if the caller provided one (avoids a
+    # redundant SAE encode pass).
+    if active_mask is not None:
+        active = np.asarray(active_mask)
+    else:
+        active = feature_activation_positions(
+            sae, embeddings, protein_ids, respos, feature_idx,
+            activation_threshold=activation_threshold, device=device,
+        )
 
     # Background composition over all proteins.
     bg = _background_composition(proteins)

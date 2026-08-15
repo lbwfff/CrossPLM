@@ -240,18 +240,25 @@ class Trainer:
         tag = f"epoch_{epoch:.2f}_f1_{int(f1 * 10000):04d}"
         self._save_checkpoint(tag, f1, epoch)
 
+        if f1 > self.best_f1:
+            self.best_f1 = f1
+            # Stable alias pointing at the best-by-F1 checkpoint, so downstream
+            # steps (eval, Single analysis) can always use `checkpoints/best`.
+            self._save_checkpoint("best", f1, epoch)
+
         self.best_checkpoints.append((f1, step, tag))
         self.best_checkpoints.sort(key=lambda x: x[0], reverse=True)
         self.best_checkpoints = self.best_checkpoints[:self.top_k]
-
-        if f1 > self.best_f1:
-            self.best_f1 = f1
 
         kept_tags = {c[2] for c in self.best_checkpoints}
         if self.task_dir:
             ckpt_root = os.path.join(self.task_dir, "checkpoints")
             if os.path.isdir(ckpt_root):
                 for d in os.listdir(ckpt_root):
+                    # Never delete the 'best'/'final' checkpoints or non-checkpoint
+                    # dirs (e.g. evaluations/, config.yaml). Only prune epoch_* tags.
+                    if d in ("best", "final") or not d.startswith("epoch_"):
+                        continue
                     if d not in kept_tags:
                         path = os.path.join(ckpt_root, d)
                         if os.path.isdir(path):
@@ -264,6 +271,18 @@ class Trainer:
         os.makedirs(ckpt_dir, exist_ok=True)
 
         self.model.save_pretrained(ckpt_dir)
+
+        # Persist the training-time label map in a sidecar file. The custom
+        # FastEsm runtime drops num_labels/id2label/label2id from the saved
+        # config.json, so this sidecar is the reliable way for `eval` to recover
+        # the exact char->class mapping.
+        label2id = getattr(self.model.config, "label2id", None)
+        if label2id:
+            with open(os.path.join(ckpt_dir, "label_map.json"), "w") as f:
+                json.dump({
+                    "label2id": {str(k): int(v) for k, v in label2id.items()},
+                    "id2label": getattr(self.model.config, "id2label", None),
+                }, f, indent=2)
 
         training_state = {
             "global_step": self.global_step,

@@ -20,6 +20,15 @@ For each feature × concept pair, computes F1 / precision / recall / AUROC
 across activation thresholds and saves a summary CSV.
 """
 
+import os
+import sys
+
+# Allow running directly from the repository root, e.g.
+#   python Single/single/scripts/analyze_sequence.py ...
+# without `cd Single` or installing the package (the `single` package lives at
+# Single/single/, two levels up from this file).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
 import argparse
 import json
 from pathlib import Path
@@ -66,9 +75,9 @@ def _load_shard_pair(embeddings_dir: Path, concepts_dir: Path, shard_id: int, de
 
     concept_matrix, metadata = load_concept_shards(concepts_dir, shard_id)
 
-    shard_emb_path = Path(embeddings_dir) / f"shard_{shard_id}" / "activations.pt"
+    shard_emb_path = Path(embeddings_dir) / f"shard_{shard_id}" / "embeddings.pt"
     if not shard_emb_path.exists():
-        cands = sorted(Path(embeddings_dir).glob(f"shard_{shard_id}/**/activations.pt"))
+        cands = sorted(Path(embeddings_dir).glob(f"shard_{shard_id}/**/embeddings.pt"))
         if not cands:
             raise FileNotFoundError(
                 f"No per-shard embeddings found for shard {shard_id} in {embeddings_dir}. "
@@ -82,11 +91,17 @@ def _load_shard_pair(embeddings_dir: Path, concepts_dir: Path, shard_id: int, de
     shard_embeddings = shard_emb.to(device)
 
     if concept_matrix.shape[0] != shard_embeddings.shape[0]:
-        print(f"  ⚠️  Concept matrix ({concept_matrix.shape[0]}) ≠ embeddings "
-              f"({shard_embeddings.shape[0]}). Using min length.")
-        n = min(concept_matrix.shape[0], shard_embeddings.shape[0])
-        concept_matrix = concept_matrix[:n]
-        shard_embeddings = shard_embeddings[:n]
+        raise ValueError(
+            f"Concept matrix ({concept_matrix.shape[0]} rows) and embeddings "
+            f"({shard_embeddings.shape[0]} tokens) do not match for shard {shard_id}.\n"
+            f"  Embeddings come from: {shard_emb_path}\n"
+            f"  Concepts come from:   {Path(concepts_dir) / f'shard_{shard_id}'}\n"
+            f"  These MUST be the SAME proteins, sharded identically. Common causes:\n"
+            f"    - Embeddings extracted from a different CSV than the concept TSV\n"
+            f"    - Different --n_shards used for extraction vs concept building\n"
+            f"    - Different sequence filtering (min/max_seq_len, --max_residues)\n"
+            f"  Re-extract embeddings from the SAME TSV used to build concepts."
+        )
 
     return concept_matrix, shard_embeddings
 
@@ -160,8 +175,18 @@ def _resolve_dirs(concepts_dir, output_dir, experiment, exp_dir):
     return Path(concepts_dir), Path(output_dir)
 
 
+def _resolve_sae_dir(sae_dir, experiment, exp_dir):
+    """--sae_dir defaults into Outputs/<experiment>/sae but stays overridable."""
+    from single.paths import resolve_experiment
+
+    if sae_dir is None:
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        sae_dir = exp.sae_dir
+        print(f"  SAE dir (inferred): {sae_dir}")
+    return Path(sae_dir)
+
+
 def cmd_align(
-    sae_dir: Path,
     embeddings_dir: Path,
     concepts_dir: Optional[Path] = None,
     output_dir: Optional[Path] = None,
@@ -176,10 +201,11 @@ def cmd_align(
     compute_domain_f1: bool = True,
     min_positives: int = 10,
     threshold_percents: Optional[List[float]] = None,
+    sae_dir: Optional[Path] = None,
 ):
     from single.analysis.concepts import load_concept_names
-    from single.paths import resolve_experiment
 
+    sae_dir = _resolve_sae_dir(sae_dir, experiment, exp_dir)
     concepts_dir, output_dir = _resolve_dirs(
         concepts_dir, output_dir, experiment, exp_dir
     )
@@ -197,7 +223,7 @@ def cmd_align(
 
     concept_names = load_concept_names(concepts_dir)
     if not concept_names:
-        raise ValueError(f"No concept columns found in {concepts_dir}/aa_concepts_columns.txt")
+        raise ValueError(f"No concept columns found in {concepts_dir}/concept_columns.txt")
 
     print("\nLoading embeddings...")
     shards_to_process = [shard] if shard is not None else list(range(len(list(Path(concepts_dir).glob("shard_*")))))
@@ -232,7 +258,6 @@ def cmd_align(
 
 
 def cmd_heldout(
-    sae_dir: Path,
     embeddings_dir: Path,
     concepts_dir: Optional[Path] = None,
     output_dir: Optional[Path] = None,
@@ -247,6 +272,7 @@ def cmd_heldout(
     min_positives: int = 10,
     threshold_percents: Optional[List[float]] = None,
     heldout_f1_threshold: float = 0.3,
+    sae_dir: Optional[Path] = None,
 ):
     """
     Held-out validation: split concept shards into valid/test, select the top
@@ -256,6 +282,7 @@ def cmd_heldout(
     from single.analysis.concepts import load_concept_names
     from single.analysis.heldout import report_heldout
 
+    sae_dir = _resolve_sae_dir(sae_dir, experiment, exp_dir)
     concepts_dir, output_dir = _resolve_dirs(
         concepts_dir, output_dir, experiment, exp_dir
     )
@@ -273,7 +300,7 @@ def cmd_heldout(
 
     concept_names = load_concept_names(concepts_dir)
     if not concept_names:
-        raise ValueError(f"No concept columns found in {concepts_dir}/aa_concepts_columns.txt")
+        raise ValueError(f"No concept columns found in {concepts_dir}/concept_columns.txt")
 
     # Split shards into valid / test
     all_shards = list(range(len(list(Path(concepts_dir).glob("shard_*")))))
@@ -341,7 +368,8 @@ def main():
 
     # align
     p_align = sub.add_parser("align", help="Align SAE features to concepts")
-    p_align.add_argument("--sae_dir", type=Path, required=True)
+    p_align.add_argument("--sae_dir", type=Path, default=None,
+                         help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     p_align.add_argument("--embeddings_dir", type=Path, required=True)
     p_align.add_argument("--experiment", type=str, default=None,
                          help="Experiment name; creates Outputs/<experiment>_<ts>/")
@@ -370,7 +398,8 @@ def main():
     # heldout
     p_held = sub.add_parser("heldout",
                             help="Held-out validation: select on valid split, evaluate on test split")
-    p_held.add_argument("--sae_dir", type=Path, required=True)
+    p_held.add_argument("--sae_dir", type=Path, default=None,
+                        help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     p_held.add_argument("--embeddings_dir", type=Path, required=True)
     p_held.add_argument("--experiment", type=str, default=None,
                         help="Experiment name; creates Outputs/<experiment>_<ts>/")
@@ -402,7 +431,7 @@ def main():
                   args.exp_dir, args.n_shards, args.min_seq_len, args.max_seq_len,
                   args.max_residues)
     elif args.command == "heldout":
-        cmd_heldout(args.sae_dir, args.embeddings_dir, args.concepts_dir,
+        cmd_heldout(args.embeddings_dir, args.concepts_dir,
                     args.output_dir, args.experiment, args.exp_dir,
                     args.split_mode, args.threshold_min_f1,
                     args.feature_chunk_size, args.batch_size,
@@ -410,16 +439,18 @@ def main():
                     compute_domain_f1=not args.no_domain_f1,
                     min_positives=args.min_positives,
                     threshold_percents=args.threshold_percents,
-                    heldout_f1_threshold=args.heldout_f1_threshold)
+                    heldout_f1_threshold=args.heldout_f1_threshold,
+                    sae_dir=args.sae_dir)
     else:
-        cmd_align(args.sae_dir, args.embeddings_dir, args.concepts_dir,
+        cmd_align(args.embeddings_dir, args.concepts_dir,
                   args.output_dir, args.experiment, args.exp_dir,
                   args.shard, args.threshold_min_f1, args.n_top_per_concept,
                   args.feature_chunk_size, args.batch_size,
                   compute_auroc=not args.no_auroc,
                   compute_domain_f1=not args.no_domain_f1,
                   min_positives=args.min_positives,
-                  threshold_percents=args.threshold_percents)
+                  threshold_percents=args.threshold_percents,
+                  sae_dir=args.sae_dir)
 
 
 if __name__ == "__main__":

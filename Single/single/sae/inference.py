@@ -11,12 +11,29 @@ from single.configs import SAEConfig
 
 def load_sae(
     model_dir: Union[str, Path],
-    model_name: str = "ae.pt",
+    model_name: Optional[str] = None,
     device: Optional[str] = None,
+    prefer_normalized: bool = True,
 ) -> Dictionary:
+    """
+    Load a trained SAE.
+
+    By default, prefers the NORMALIZED weights (`model_normalized.pt`, which stores
+    per-feature max-activation rescale factors) over the raw `model.pt`, so downstream
+    alignment/metrics use features on a comparable 0-1 scale. Set
+    `prefer_normalized=False` or pass an explicit `model_name` to force a specific
+    checkpoint.
+    """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     model_dir = Path(model_dir)
+
+    if model_name is None:
+        # Prefer the normalized checkpoint if it exists.
+        if prefer_normalized and (model_dir / "model_normalized.pt").exists():
+            model_name = "model_normalized.pt"
+        else:
+            model_name = "model.pt"
 
     state_dict = torch.load(
         model_dir / model_name, map_location=torch.device(device), weights_only=True
@@ -29,6 +46,8 @@ def load_sae(
     else:
         sae = ReLUSAE.from_pretrained(model_dir / model_name, device=device)
 
+    if model_name == "model_normalized.pt":
+        print(f"  Loaded normalized SAE: {model_dir / model_name}")
     return sae
 
 

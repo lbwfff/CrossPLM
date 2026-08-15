@@ -1,11 +1,13 @@
 import os
-from datetime import datetime
 
 
 def create_task_folder(base_dir: str, task_name: str) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    folder_name = f"{task_name}_{timestamp}"
-    task_dir = os.path.join(base_dir, folder_name)
+    """Create an experiment directory `<base_dir>/<task_name>` (verbatim, no timestamp).
+
+    Same convention as the interpretability module's Outputs/<experiment>, so a
+    given task name always maps to the same directory.
+    """
+    task_dir = os.path.join(base_dir, task_name)
     os.makedirs(task_dir, exist_ok=True)
     return task_dir
 

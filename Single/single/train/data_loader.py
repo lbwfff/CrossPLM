@@ -13,7 +13,7 @@ class ActivationDataset(Dataset):
 
     Supports:
     - Single tensor file (.pt)
-    - Sharded directory structure (shard_N/activations.pt)
+    - Sharded directory structure (shard_N/embeddings.pt)
     - Memory-mapped .dat files
     """
 
@@ -63,7 +63,7 @@ class ActivationDataset(Dataset):
                     m = re.match(r"shard_(\d+)", subdir.name)
                     if not m or int(m.group(1)) != self.shard:
                         continue
-                pt_file = subdir / "activations.pt"
+                pt_file = subdir / "embeddings.pt"
                 if pt_file.exists():
                     data = torch.load(pt_file, map_location="cpu", weights_only=True)
                     if isinstance(data, dict):

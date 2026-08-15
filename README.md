@@ -15,7 +15,7 @@ Dataset/  Preprocessing/   Training/        Single/        Outputs/
 
 | Directory | Role |
 |-----------|------|
-| `Dataset/` | Raw datasets (`mBMRB.csv`, `relaxdb_data.csv`) |
+| `Dataset/` | Raw datasets (`mBMRB.csv`, `relaxdb_data.csv`), downloaded annotations (`uniprotkb_swissprot.tsv`), and label-map YAMLs (from `crossplm.py labelmap`) |
 | `Preprocessing/` | Dataset-specific label preprocessing scripts |
 | `Training/` | PLM fine-tuning framework (init / train / eval CLI) |
 | `Single/` | SAE-based interpretability: extract → train SAE → analyze |
@@ -33,7 +33,6 @@ CrossPLM/
 ├── Training/                    # PLM training framework
 │   ├── crossplm.py              # Unified CLI (init / train / eval)
 │   ├── crossplm/                # Python package
-│   ├── outputs/                 # Training outputs (checkpoints, logs)
 │   └── examples/                # Sample data and configs
 ├── Single/                      # SAE-based interpretability
 │   ├── setup.py
@@ -46,8 +45,8 @@ CrossPLM/
 │       ├── train/               # SAE training loop
 │       ├── analysis/            # Feature-to-label & feature-to-concept alignment
 │       └── scripts/             # CLI scripts
-├── Outputs/                     # Per-experiment output trees
-│   └── <experiment>/            # embeddings / sae / concepts / analysis
+├── Outputs/                     # SHARED experiment root (Training + Single)
+│   └── <experiment>/            # config, checkpoints, embeddings, sae, concepts, analysis
 └── README.md
 ```
 
@@ -58,34 +57,77 @@ CrossPLM/
 Fine-tunes a HuggingFace protein language model (e.g. ESM-2) on a per-residue
 token-classification task (e.g. backbone dynamics: rigid vs flexible).
 
-### 0. Preprocess Data
-```bash
-cd Preprocessing
-python preprocess_mbmrb.py          # → ../Training/examples/mbmrb_processed.csv
-python preprocess_relaxdb.py        # → ../Training/examples/relaxdb_processed.csv
+### 0. Data & Label Map (optional preprocessing)
+
+The Training and Single modules share the **same label-map presets**
+(`mBMRB`, `relaxdb`, `ss3`) and YAML label-map files. A label map defines the
+CSV columns, the character → class mapping, and which characters are ignored —
+so you can usually point training directly at a **raw** dataset CSV:
+
+```yaml
+# my_dataset.yaml
+sequence_column: sequence   # column holding the protein sequence
+label_column: label         # column holding the per-residue label string
+positive_class: 1
+class_names: {0: rigid, 1: flexible}
+mapping: {A: 0, ".": 1, "0": 0, "1": 1}   # char -> class id (binary or multi-class)
+ignore: "_"                 # chars excluded from training/eval (-100)
 ```
+
+Characters not in `mapping` are ignored too (encoded as `-100`, excluded from
+train/eval). Preprocessing scripts (`Preprocessing/`) are **optional** — they
+only exist to produce relabeled `0/1` CSVs; with a label map you can skip them.
+
+**Generate an empty template** into `Dataset/` (shared by both modules):
+```bash
+python Training/crossplm.py labelmap --name my_dataset
+# → Dataset/my_dataset.yaml
+```
+Then reference it in a config as `label_map: ../Dataset/my_dataset.yaml` or via
+`--label_map ../Dataset/my_dataset.yaml` (relative paths resolve against
+`Training/`).
 
 ### 1. Initialize a Task
 ```bash
-cd Training
-python crossplm.py init --task_name my_experiment
+# run from the repository root (no cd needed)
+python Training/crossplm.py init --task_name my_experiment
 ```
-→ Creates `outputs/tasks/my_experiment_<ts>/config.yaml` template.
+→ Creates `Outputs/my_experiment/config.yaml` template (verbatim name, no timestamp,
+shared with the Single module's `Outputs/<experiment>` root).
 
 ### 2. Edit Config → Train
-Edit the `config.yaml`, then:
+Edit `Outputs/my_experiment/config.yaml`, then:
 ```bash
-python crossplm.py train --config outputs/tasks/my_experiment_<ts>/config.yaml
+python Training/crossplm.py train --config Outputs/my_experiment/config.yaml
 ```
-→ Checkpoints, training curve, and logs are saved inside the task folder.
+→ Checkpoints, training curve, and logs are saved inside the experiment folder.
+
+The config's `label_map:` field takes a preset name or YAML path (default
+template uses `mBMRB` and points `csv_data_path` at the raw
+`../Dataset/mBMRB.csv`). Relative `csv_data_path` / `label_map` YAML paths
+resolve against the `Training/` module directory, so they work regardless of
+where you run the command from. Leave `label_map` empty to infer the mapping
+from the CSV (legacy).
 
 ### 3. Evaluate a Checkpoint
 ```bash
-python crossplm.py eval \
-  --checkpoint outputs/tasks/my_experiment_<ts>/checkpoints/epoch_10_f1_7952 \
-  --csv ./examples/relaxdb_processed.csv
+python Training/crossplm.py eval \
+  --checkpoint Outputs/my_experiment/checkpoints/best \
+  --csv Dataset/mBMRB.csv \
+  --label_map mBMRB
 ```
-→ Results (metrics.json, confusion matrix, AUPRC curve) are saved inside the task folder.
+→ Results (metrics.json, confusion matrix, AUPRC curve) are saved to
+`Outputs/my_experiment/evaluations/<csv_name>/`.
+
+Training saves three kinds of checkpoints under `Outputs/<name>/checkpoints/`:
+`epoch_<N>_f1_<F>` (best-3 by F1, auto-pruned), `best` (stable alias for the
+highest-F1 one — use this for evaluation/interpretability), and `final`.
+
+Evaluation reuses the label map persisted with the checkpoint (a `label_map.json`
+sidecar written by training, or `config.label2id`). Passing `--label_map <preset|yaml>`
+is recommended — it makes the label semantics explicit and also works on checkpoints
+trained before the sidecar existed. Any label character not in the mapping is
+ignored (`-100`), consistent with training.
 
 ### Features
 
@@ -95,9 +137,10 @@ python crossplm.py eval \
 | **CSV input** | `sequence` + `label` columns, automatic train/eval split |
 | **Ignore positions** | `_` labels are excluded from loss |
 | **Auto class weights** | `inverse` / `log` / `none` strategies |
+| **Configurable label maps** | `label_map:` in the config uses Single's presets (`mBMRB`, `relaxdb`, `ss3`) or a YAML file, instead of inferring from the CSV |
 | **Multi-class support** | Correct class count for many-to-one label maps (mBMRB, relaxdb, ss3) |
 | **Metrics** | Loss + Accuracy + Macro F1 + AUPRC (macro over all classes) |
-| **Top-3 checkpoints** | Keeps best 3 by F1, cleans old ones automatically |
+| **Top-3 checkpoints** | Keeps best 3 by F1, cleans old ones automatically; `checkpoints/best` is a stable alias for the highest-F1 checkpoint |
 | **Training curve** | Auto-generated epoch–F1 plot after training |
 | **Eval plots** | Confusion matrix + Precision-Recall curve |
 
@@ -149,17 +192,33 @@ Each feature can then be interpreted by checking **when** it activates:
 ### Shared Conventions
 
 **Experiment directory.** Every step routes outputs into one directory,
-`Outputs/<experiment>/` (the name is used verbatim, no timestamp). Re-running a step
-with the same name reuses the directory (e.g. overwrites `ae.pt`). Use distinct
-names for distinct runs, or `--exp_dir <existing_dir>` to point at one directly.
+`Outputs/<experiment>/` (the name is used verbatim, no timestamp), the **same
+root the Training module uses**. Re-running a step with the same name reuses the
+directory (e.g. overwrites `model.pt`). Use distinct names for distinct runs, or
+`--exp_dir <existing_dir>` to point at one directly.
 
 ```
 Outputs/<experiment>/
-    embeddings/layer_<N>/shard_<i>/activations.pt
-    sae/ae.pt
-    concepts/shard_<i>/aa_concepts.npz
+    embeddings/layer_<N>/shard_<i>/embeddings.pt
+    sae/model.pt           # trained SAE weights
+    sae/model_normalized.pt # per-feature max-activation rescale (see below)
+    concepts/shard_<i>/concept_matrix.npz
     analysis/*.csv|*.json|visualizations/
 ```
+
+**Feature normalization.** `analyze_features` computes each feature's max
+activation and saves a normalized copy `sae/model_normalized.pt`. All analysis
+scripts load the SAE via `load_sae`, which **auto-prefers `model_normalized.pt`
+when present**, putting every feature on a comparable 0–1 scale (so a
+`--threshold_percents 0.15` means "activation > 15% of that feature's max").
+Re-running `train_sae` removes any stale `model_normalized.pt` so it is regenerated
+for the new model.
+
+**Length-filter consistency.** Scripts that rebuild the protein/residue mapping
+from the sequences CSV (`analyze_sequence`, `analyze_coactivation`,
+`visualize_features`) accept `--min_seq_len` / `--max_seq_len`. If you used those
+flags during `extract_embeddings`, pass the **same values** here too — otherwise
+the residue mapping silently misaligns.
 
 **Configurable label maps.** Label encoding is not hardcoded to mBMRB. Every script
 accepts `--label_map <preset>` (from `single/label_maps.py`) or a YAML file:
@@ -176,13 +235,19 @@ accepts `--label_map <preset>` (from `single/label_maps.py`) or a YAML file:
 Custom YAML:
 ```yaml
 # my_dataset.yaml
+sequence_column: sequence   # column holding the protein sequence
+label_column: label         # column holding the per-residue label string
 positive_class: 1
 class_names: {0: rigid, 1: flexible}
-mapping: {A: 0, ".": 1, "0": 0, "1": 1}
-ignore: "_"
+mapping: {A: 0, ".": 1, "0": 0, "1": 1}   # char -> class id (binary or multi-class)
+ignore: "_"                 # documented ignore chars (any unmapped char is ignored too)
 ```
 Characters not in `mapping` become `-100` (ignored), following the HuggingFace
 ignore-index convention.
+
+> The `relaxdb` preset accepts **both** the raw `relaxdb_data.csv` characters
+> (`p/A/v→0`, `./b/^→1`, `t/x` ignored) and the preprocessed `0/1` form, so one
+> preset works whether or not you use `Preprocessing/preprocess_relaxdb.py`.
 
 ### 2.1 Task-Label Alignment
 
@@ -190,33 +255,29 @@ Align each SAE feature with the task labels (e.g. rigid/flexible) to find
 "flexibility detectors".
 
 ```bash
-cd Single
-
 # Extract hidden states from the fine-tuned model (creates Outputs/mb/)
-python -m single.scripts.extract_embeddings \
-    --ckpt_path ../Training/outputs/tasks/my_task/checkpoints/best \
-    --sequences_csv ../Dataset/mBMRB.csv \
+python Single/single/scripts/extract_embeddings.py \
+    --ckpt_path Outputs/my_task/checkpoints/best \
+    --sequences_csv Dataset/mBMRB.csv \
     --experiment mb \
     --label_column label --label_map mBMRB
 
 # Train SAE (320-dim → 640 features; embeddings inferred, all shards by default)
-python -m single.scripts.train_sae \
+python Single/single/scripts/train_sae.py \
     --experiment mb \
     --batch_size 64 --dict_size 640 --steps 20000 --l1_penalty 0.08 \
     --resample_steps 2000
 
 # Align features with task labels
-python -m single.scripts.analyze_features \
-    --sae_dir ../Outputs/mb/sae \
-    --embeddings_dir ../Outputs/mb/embeddings/layer_6 \
+python Single/single/scripts/analyze_features.py \
+    --embeddings_dir Outputs/mb/embeddings/layer_6 \
     --experiment mb \
-    --sequences_csv ../Dataset/mBMRB.csv --label_column label --label_map mBMRB
+    --sequences_csv Dataset/mBMRB.csv --label_column label --label_map mBMRB
 
 # Visualize top features on sequences (embeddings_path inferred from experiment)
-python -m single.scripts.visualize_features \
-    --sae_dir ../Outputs/mb/sae \
+python Single/single/scripts/visualize_features.py \
     --experiment mb \
-    --sequences_csv ../Dataset/mBMRB.csv \
+    --sequences_csv Dataset/mBMRB.csv \
     --feature_indices 234 426 --label_map mBMRB
 ```
 
@@ -241,7 +302,9 @@ Top features for 'flexible' (label=1):
 
 Align SAE features against **biological concepts** — e.g. "Helix",
 "Domain_kinase", "Binding_site_ATP" — to discover what real biology each feature
-encodes. Two-step pipeline (`single/scripts/analyze_concepts.py`).
+encodes. Pipeline: build concept matrices, extract embeddings + train a separate
+SAE for this experiment, then align features to concepts
+(`single/scripts/analyze_concepts.py`).
 
 **Step 1: Build per-residue concept matrices from a UniProtKB TSV export.**
 
@@ -250,30 +313,60 @@ The TSV must contain `Entry`, `Sequence`, and Feature-table columns (`Helix`,
 Download from UniProt with `reviewed:true` → Export → TSV.
 
 ```bash
-python -m single.scripts.analyze_concepts build \
-    --annotations_tsv ../Dataset/uniprotkb_swissprot.tsv \
+python Single/single/scripts/analyze_concepts.py build \
+    --annotations_tsv Dataset/uniprotkb_swissprot.tsv \
     --experiment sp \
     --n_shards 5 \
     --max_residues 510   # must equal embedder max_length - 2 (512 -> 510)
 ```
 
-> **Alignment requirement:** `--max_residues` (embedder `max_length` − 2) makes
-> concept rows cover exactly the residues the embedder keeps, avoiding misalignment
-> on long sequences.
+> **Alignment requirement:** the concept shards must contain the **same proteins,
+> in the same order, sharded identically** as the embedding shards. That means
+> extracting embeddings from the **same TSV** with the same `--n_shards` and the
+> same `--min_seq_len` / `--max_seq_len` length filter (concept building defaults
+> to `30` / `1022`), using `--sequence_column Sequence`. `--max_residues`
+> (`max_length` − 2) then makes concept rows cover exactly the residues the
+> embedder keeps on long sequences.
+>
+> If the token counts of a concept shard and its embedding shard do not match,
+> `analyze_concepts align` now **fails with an error** (instead of silently
+> truncating), so a mis-configured run is caught instead of producing garbage.
+
+**Extract embeddings from the SAME TSV** (must match the concept build above):
+
+```bash
+python Single/single/scripts/extract_embeddings.py \
+    --ckpt_path Outputs/my_task/checkpoints/best \
+    --sequences_csv Dataset/uniprotkb_swissprot.tsv \
+    --sequence_column Sequence \
+    --experiment sp \
+    --n_shards 5 --min_seq_len 30 --max_seq_len 1022
+```
+
+> No `--label_column` here — UniProt has no per-residue task labels; the embedder
+> only needs the `Sequence` column.
+
+**Train an SAE on the Swiss-Prot embeddings** (the `sp` experiment has its own
+`Outputs/sp/sae`, separate from `mb`):
+
+```bash
+python Single/single/scripts/train_sae.py \
+    --experiment sp \
+    --batch_size 64 --dict_size 640 --steps 20000 --l1_penalty 0.08 \
+    --resample_steps 2000
+```
 
 **Step 2: Align SAE features to concepts.**
 
 ```bash
-python -m single.scripts.analyze_concepts align \
-    --sae_dir ../Outputs/sp/sae \
-    --embeddings_dir ../Outputs/sp/embeddings/layer_6 \
+python Single/single/scripts/analyze_concepts.py align \
+    --embeddings_dir Outputs/sp/embeddings/layer_6 \
     --experiment sp \
     --threshold_percents 0 0.15 0.5 0.6 0.8
 ```
 
 For every feature × concept pair, computes F1 / precision / recall / AUROC /
-domain-F1 across thresholds, saving `feature_concept_pairs.csv` (all pairs) and
-`feature_concept_metrics.json`.
+domain-F1 across thresholds, saving `feature_concept_pairs.csv` (all pairs).
 
 **Example output:**
 ```
@@ -299,9 +392,8 @@ features some score high purely by chance.
 3. On **test**, evaluate only the selected pairs (unbiased).
 
 ```bash
-python -m single.scripts.analyze_concepts heldout \
-    --sae_dir ../Outputs/sp/sae \
-    --embeddings_dir ../Outputs/sp/embeddings/layer_6 \
+python Single/single/scripts/analyze_concepts.py heldout \
+    --embeddings_dir Outputs/sp/embeddings/layer_6 \
     --experiment sp \
     --split_mode half \
     --threshold_percents 0 0.15 0.5 0.6 0.8
@@ -323,14 +415,22 @@ Loss_Recovered = 1 - (ce_sae - ce_orig) / (ce_zero - ce_orig)
 100% = perfectly preserves task info; 0% = as harmful as zeroing the layer.
 
 ```bash
-python -m single.scripts.evaluate_fidelity \
-    --ckpt_path ../Training/outputs/tasks/my_task/checkpoints/best \
-    --sequences_csv ../Dataset/mBMRB.csv \
-    --sae_dir ../Outputs/sp/sae \
-    --experiment sp \
-    --layer 6 --label_column label --label_map mBMRB
+python Single/single/scripts/evaluate_fidelity.py \
+    --ckpt_path Outputs/my_task/checkpoints/best \
+    --sequences_csv Dataset/mBMRB.csv \
+    --experiment mb \
+    --layer 6 --label_column label --label_map mBMRB \
+    --max_sequences 200
 ```
 Saves `fidelity_results.json` incl. a `reconstruction_mse` sanity check.
+`--max_sequences` limits to a subset for a quick check — drop it to evaluate the
+whole dataset.
+
+> **Data consistency:** each experiment keeps its own `embeddings/`, `sae/`,
+> `concepts/`, `analysis/` dirs, so running `sp` does not overwrite `mb`. Fidelity
+> and intervention must use the SAE trained on the **same data** as the sequences
+> they feed (`--experiment mb` + mBMRB).
+
 **Note:** injection currently supports the final layer only
 (`hidden_states[6]` = `emb_layer_norm_after` output).
 
@@ -341,15 +441,16 @@ change — establishing that the feature *causally drives* (not just co-occurs
 with) the model's decision.
 
 ```bash
-python -m single.scripts.evaluate_intervention \
-    --ckpt_path ../Training/outputs/tasks/my_task/checkpoints/best \
-    --sequences_csv ../Dataset/mBMRB.csv \
-    --sae_dir ../Outputs/mb/sae \
+python Single/single/scripts/evaluate_intervention.py \
+    --ckpt_path Outputs/my_task/checkpoints/best \
+    --sequences_csv Dataset/mBMRB.csv \
     --experiment mb \
     --feature_idx 375 --mode zero \
     --label_column label --label_map mBMRB \
     --layer 6 --max_sequences 200
 ```
+
+`--max_sequences 200` limits to a quick subset — drop it to run the full dataset.
 
 - `--feature_idx N` — the feature to perturb.
 - `--mode zero|amplify|set` — set to 0, scale up (`--scale`), or force a value.
@@ -377,10 +478,9 @@ sequence data (no 3D structures required):
   "signature" of the feature.
 
 ```bash
-python -m single.scripts.analyze_sequence \
-    --sae_dir ../Outputs/mb/sae \
-    --embeddings_dir ../Outputs/mb/embeddings/layer_6 \
-    --sequences_csv ../Dataset/mBMRB.csv \
+python Single/single/scripts/analyze_sequence.py \
+    --embeddings_dir Outputs/mb/embeddings/layer_6 \
+    --sequences_csv Dataset/mBMRB.csv \
     --experiment mb \
     --feature_indices 375 42 \
     --shard 0
@@ -402,10 +502,9 @@ Answers whether two features activate on the **same residues**, on residues
 redundant vs complementary (co-regulatory) features.
 
 ```bash
-python -m single.scripts.analyze_coactivation \
-    --sae_dir ../Outputs/mb/sae \
-    --embeddings_dir ../Outputs/mb/embeddings/layer_6 \
-    --sequences_csv ../Dataset/mBMRB.csv \
+python Single/single/scripts/analyze_coactivation.py \
+    --embeddings_dir Outputs/mb/embeddings/layer_6 \
+    --sequences_csv Dataset/mBMRB.csv \
     --experiment mb \
     --feature_a 375 --feature_b 42 \
     --shard 0
@@ -448,39 +547,56 @@ pip install -r requirements.txt
 ```
 Or install the SAE package in development mode (pulls deps from `setup.py`):
 ```bash
-cd Single && pip install -e .
+pip install -e Single/
 ```
 
 ---
 
 ## Output Structure
 
-Every step writes into one **experiment directory** (named by `--experiment`,
-verbatim, no timestamp; reuse with `--exp_dir`):
+The Training and Single modules share one **experiment directory**
+(`Outputs/<experiment>/`, name used verbatim, no timestamp; reuse with
+`--exp_dir`):
 
 ```
 Outputs/
 └── <experiment>/
-    ├── embeddings/layer_<N>/shard_<i>/activations.pt   # Hidden states
+    ├── config.yaml                                # Training config
+    ├── training_curve.png                         # Training curve
+    ├── eval_metrics.jsonl                         # Training eval history
+    ├── checkpoints/                               # Trained PLM checkpoints
+    │   ├── epoch_<N>_f1_<F>/                      # Best-3 by F1 (auto-pruned)
+    │   ├── best/                                  # Stable alias: highest-F1
+    │   ├── final/                                 # Final checkpoint
+    │   └── ...                                    # each contains label_map.json
+    ├── evaluations/<csv_name>/                    # PLM eval (metrics.json, plots)
+    ├── embeddings/layer_<N>/shard_<i>/embeddings.pt   # Hidden states
     ├── sae/
-    │   ├── ae.pt                                       # SAE weights
-    │   └── checkpoint_<step>/
+    │   ├── model.pt                               # SAE weights
+    │   ├── model_normalized.pt                    # Max-activation rescaled SAE
+    │   └── checkpoints/step_<N>/                  # Resumable SAE checkpoints
     ├── concepts/
-    │   ├── shard_<i>/aa_concepts.npz                   # Per-residue concepts
-    │   └── aa_concepts_columns.txt
+    │   ├── shard_<i>/concept_matrix.npz           # Per-residue concepts
+    │   ├── shard_<i>/residues.csv                 # Residue metadata
+    │   └── concept_columns.txt
     └── analysis/
-        ├── feature_concept_pairs.csv                   # Concept alignment
-        ├── feature_label_metrics.json                  # Task-label alignment
-        ├── heldout_*.csv                               # Held-out validation
-        ├── fidelity_results.json                       # Fidelity
-        ├── intervention_feat<N>_<mode>.json            # Causal intervention
-        ├── sequence_analysis_shard<N>.json             # Cohen's d + motif
-        ├── coactivation_<a>_<b>_shard<N>.json          # Pairwise co-activation
-        └── visualizations/                             # PNG plots
+        ├── feature_label_metrics.json             # Task-label alignment
+        ├── feature_label_correlations.npy         # Point-biserial r per feature
+        ├── activation_profile.npz                 # Per-class mean/max activation
+        ├── max_activations_per_feature.pt         # Used to build model_normalized.pt
+        ├── feature_concept_pairs.csv              # Feature × concept alignment
+        ├── heldout_*.csv                          # Held-out validation
+        ├── fidelity_results.json                  # Fidelity
+        ├── intervention_feat<N>_<mode>.json       # Causal intervention
+        ├── sequence_analysis_shard<N>.json        # Cohen's d + motif
+        ├── coactivation_<a>_<b>_shard<N>.json     # Pairwise co-activation
+        └── visualizations/                        # PNG plots
 ```
 
-`single/paths.py` centralizes these paths. Explicit `--output_dir` / `--save_dir`
-/ `--concepts_dir` flags override the routing.
+`single/paths.py` centralizes these paths. `--sae_dir` / `--embeddings_dir` /
+`--output_dir` / `--save_dir` / `--concepts_dir` default into the experiment dir
+and can be overridden explicitly; `--exp_dir <path>` points at an existing
+experiment dir verbatim.
 
 ---
 

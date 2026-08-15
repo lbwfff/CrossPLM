@@ -82,17 +82,6 @@ def _model_loss_with_override(
     return out.loss.item()
 
 
-def _get_hidden_states(model, tokens, attention_mask, layer_idx):
-    """Get the model's own hidden_states[layer_idx] for a batch."""
-    with torch.no_grad():
-        out = model(
-            input_ids=tokens,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-    return out.hidden_states[layer_idx]
-
-
 def _extract_sae_reconstructions(sae: Dictionary, hidden: torch.Tensor) -> torch.Tensor:
     """
     Reconstruct the hidden states using the SAE.
@@ -139,7 +128,8 @@ def evaluate_fidelity(
     ce_orig_list, ce_sae_list, ce_zero_list = [], [], []
     recon_mse_list = []  # sanity check: how close is SAE reconstruction to original
 
-    for i in range(0, len(sequences), batch_size):
+    for i in tqdm(range(0, len(sequences), batch_size), desc="Evaluating fidelity",
+                  unit="batch", total=(len(sequences) + batch_size - 1) // batch_size):
         batch_seqs = sequences[i : i + batch_size]
         batch_labels = labels[i : i + batch_size]
 
@@ -163,13 +153,16 @@ def evaluate_fidelity(
                 enc_ids += [-100] * (seq_len - len(enc_ids))
             label_ids[b, 1 : seq_len + 1] = torch.tensor(enc_ids[:seq_len])
 
-        # 1) original loss
-        ce_orig = _model_loss_with_override(
-            model, tokens, attn, label_ids, injection, None
-        )
+        # 1) original loss AND hidden states in ONE forward pass (saves a pass)
+        with torch.no_grad():
+            out = model(
+                input_ids=tokens, attention_mask=attn, labels=label_ids,
+                output_hidden_states=True,
+            )
+        ce_orig = out.loss.item()
+        hidden = out.hidden_states[layer_idx]
 
         # 2) zero-ablation loss (worst case)
-        hidden = _get_hidden_states(model, tokens, attn, layer_idx)
         zeros = torch.zeros_like(hidden)
         ce_zero = _model_loss_with_override(
             model, tokens, attn, label_ids, injection, zeros
@@ -310,7 +303,8 @@ def evaluate_intervention(
     n_to_neg = 0           # flips that became a non-positive class (active positions)
     pos_class = label_map_spec["positive_class"]
 
-    for i in range(0, len(sequences), batch_size):
+    for i in tqdm(range(0, len(sequences), batch_size), desc="Intervention",
+                  unit="batch", total=(len(sequences) + batch_size - 1) // batch_size):
         batch_seqs = sequences[i : i + batch_size]
         batch_labels = labels[i : i + batch_size]
 
@@ -324,15 +318,17 @@ def evaluate_intervention(
         tokens = enc["input_ids"].to(device)
         attn = enc["attention_mask"].to(device)
 
-        # Baseline logits (original hidden states)
-        base_logits = _model_logits_with_override(
-            model, tokens, attn, injection, None
-        )
+        # Baseline logits AND hidden states in ONE forward pass
+        with torch.no_grad():
+            out = model(
+                input_ids=tokens, attention_mask=attn, output_hidden_states=True
+            )
+        base_logits = out.logits
         base_preds = base_logits.argmax(dim=-1)
+        hidden = out.hidden_states[layer_idx]
 
         # Steered logits (perturb one feature). Encode once; reuse for both the
         # active-mask and the steering (avoids a redundant SAE encode pass).
-        hidden = _get_hidden_states(model, tokens, attn, layer_idx)
         f = sae.encode(hidden)  # [B, L, dict_size]
         active_mask = f[..., feature_idx] > 0  # tokens where the feature fires
         f_steered = f.clone()

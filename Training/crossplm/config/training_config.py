@@ -41,11 +41,13 @@ class TrainingConfig:
     class_weight_method: str = "inverse"
     ignore_pad_token_for_loss: bool = True
     resume_from_checkpoint: Optional[str] = None
-    # Optional label-map preset (from Single's single/label_maps.py) or path to a
-    # YAML label-map file. When set, the training label->id mapping is taken from
-    # it (deterministic, consistent with the interpretability module) instead of
-    # being inferred from the CSV with sorted(unique). E.g. "ss3" for 3-class
-    # secondary structure {H:0, E:1, C:2}. Leave empty to infer from data.
+    # Optional label-map preset (from Single's single/label_maps.py) or a path to
+    # a YAML label-map file. This is the SAME label encoding used by the
+    # interpretability module, so Training and Single always interpret a dataset
+    # identically. A preset/YAML may also define the sequence/label CSV columns;
+    # when set it takes precedence over sequence_column/label_column below.
+    # E.g. "mBMRB" for {A:0, .:1}, "relaxdb" for the raw relaxdb chars, "ss3"
+    # for 3-class secondary structure. Leave empty to infer the map from the CSV.
     label_map: str = ""
 
     def __post_init__(self):
@@ -90,13 +92,23 @@ model_name: esm2_t6_8M
 # HuggingFace backbone model ID
 backbone_model_id: facebook/esm2_t6_8M_UR50D
 
-# Path to training CSV (required, relative or absolute)
-csv_data_path: ./examples/sample.csv
+# Path to training CSV (required). Relative paths are resolved against the
+# Training/ module directory (not the CWD), so "../Dataset/mBMRB.csv" means the
+# repo's Dataset/ folder no matter where you run the command from.
+# You can point directly at a RAW dataset (e.g. ../Dataset/mBMRB.csv) — no
+# separate preprocessing step is needed when a label_map is set below.
+csv_data_path: ../Dataset/mBMRB.csv
 
-# Column name for sequences in the CSV
+# Unified label map (same as the interpretability module):
+#   a preset name: mBMRB | relaxdb | ss3   (from Single/single/label_maps.py)
+#   or a path to a YAML file.
+# The preset/YAML defines which columns hold the sequence and label strings,
+# how each label character maps to a class, and which characters are ignored.
+# Leave empty to infer the mapping from the CSV (legacy).
+label_map: mBMRB
+
+# Column names (only used when label_map is empty, or to override a preset's)
 sequence_column: sequence
-
-# Column name for per-residue labels in the CSV
 label_column: label
 
 # Train/eval split ratio (0~1), the rest is used for eval

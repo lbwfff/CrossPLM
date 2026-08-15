@@ -89,14 +89,13 @@ class SAETrainingRun:
                 progress.set_postfix(loss=f"{loss_val:.4f}")
 
             if step > 0 and step % save_steps == 0:
-                ckpt_dir = save_dir / f"checkpoint_{step}"
+                ckpt_dir = save_dir / "checkpoints" / f"step_{step}"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 trainer.save_checkpoint(ckpt_dir)
-                t.save(trainer.ae.state_dict(), save_dir / f"ae_step_{step}.pt")
                 # Persist training_state so --resume_from can pick up the step.
                 t.save(self.training_state, ckpt_dir / "training_state.pt")
 
-        t.save(trainer.ae.state_dict(), save_dir / "ae.pt")
+        t.save(trainer.ae.state_dict(), save_dir / "model.pt")
         print(f"\n{'='*50}")
         print("Training complete. Final metrics on last batch:")
         final = self.compute_metrics(batch)

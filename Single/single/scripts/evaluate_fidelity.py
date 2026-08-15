@@ -7,12 +7,21 @@ layer activations with SAE reconstructions and comparing task loss.
 
 Usage:
     python -m single.scripts.evaluate_fidelity \
-        --ckpt_path ../Training/outputs/tasks/.../checkpoints/best \
+        --ckpt_path ../Outputs/my_experiment/checkpoints/best \
         --sequences_csv ../Dataset/mBMRB.csv \
         --sae_dir ../Outputs/.../sae \
         --label_column label --label_map mBMRB \
         --layer 6
 """
+
+import os
+import sys
+
+# Allow running directly from the repository root, e.g.
+#   python Single/single/scripts/analyze_sequence.py ...
+# without `cd Single` or installing the package (the `single` package lives at
+# Single/single/, two levels up from this file).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 import argparse
 import json
@@ -30,7 +39,7 @@ from single.train.fidelity import evaluate_fidelity
 def evaluate(
     ckpt_path: Path,
     sequences_csv: Path,
-    sae_dir: Path,
+    sae_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
     output_dir: Optional[Path] = None,
@@ -45,8 +54,14 @@ def evaluate(
     from transformers import AutoModelForTokenClassification, AutoTokenizer
     from single.paths import resolve_experiment
 
-    if output_dir is None:
+    # --sae_dir and --output_dir default into Outputs/<experiment>/.
+    exp = None
+    if sae_dir is None or output_dir is None:
         exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+    if sae_dir is None:
+        sae_dir = exp.sae_dir
+        print(f"  SAE dir (inferred): {sae_dir}")
+    if output_dir is None:
         output_dir = exp.analysis_dir
         print(f"Experiment dir: {exp.dir}")
     output_dir = Path(output_dir)
@@ -134,7 +149,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate SAE fidelity on a fine-tuned PLM")
     parser.add_argument("--ckpt_path", type=Path, required=True, help="Fine-tuned model checkpoint")
     parser.add_argument("--sequences_csv", type=Path, required=True, help="CSV with sequences+labels")
-    parser.add_argument("--sae_dir", type=Path, required=True, help="Trained SAE directory")
+    parser.add_argument("--sae_dir", type=Path, default=None,
+                        help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     parser.add_argument("--experiment", type=str, default=None)
     parser.add_argument("--exp_dir", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, default=None)

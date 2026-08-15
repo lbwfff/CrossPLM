@@ -4,12 +4,21 @@ Extract hidden state embeddings from the fine-tuned ESM2-8M model for SAE traini
 
 Usage:
     python scripts/extract_embeddings.py \
-        --ckpt_path ../Training/outputs/tasks/just_test_20260813_113758/checkpoints/epoch_0.26_f1_7904 \
+        --ckpt_path ../Outputs/my_experiment/checkpoints/epoch_0.26_f1_7904 \
         --sequences_csv ../Dataset/mBMRB.csv \
         --output_dir ../data/embeddings/esm2_8m/layer_6 \
         --layer 6 \
         --batch_size 8
 """
+
+import os
+import sys
+
+# Allow running directly from the repository root, e.g.
+#   python Single/single/scripts/analyze_sequence.py ...
+# without `cd Single` or installing the package (the `single` package lives at
+# Single/single/, two levels up from this file).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 import argparse
 from pathlib import Path
@@ -35,6 +44,8 @@ def extract_embeddings(
     sequence_column: str = "sequence",
     n_shards: int = 5,
     label_map: str = "mBMRB",
+    min_seq_len: int = 0,
+    max_seq_len: int = 10_000,
 ):
     from single.paths import resolve_experiment
 
@@ -57,28 +68,22 @@ def extract_embeddings(
     print(f"Extracting layer {layer} (0-indexed, total {embedder.n_layers} layers)")
     print(f"Label map: {label_map}")
 
-    # Auto-detect separator (TSV vs CSV)
-    import re
-    with open(sequences_csv, "r") as _f:
-        _first = _f.readline()
-    sep = "\t" if _first.count("\t") > _first.count(",") else ","
-    df = pd.read_csv(sequences_csv, sep=sep, low_memory=False)
+    # Shared loader: auto-detect separator, optional length filter (must MATCH
+    # build_concept_matrix's filter so embedding/concept shards contain the SAME
+    # proteins), and fixed-seed shuffle+shard — all in single.data.
+    from single.data import load_sequences_df, shuffled_shards
+    df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
+                           min_seq_len=min_seq_len, max_seq_len=max_seq_len)
     sequences = df[sequence_column].tolist()
-    print(f"Loaded {len(sequences)} sequences (sep={sep!r})")
+    print(f"Loaded {len(sequences)} sequences")
 
     has_labels = label_column is not None and label_column in df.columns
     if has_labels:
         df[label_column] = df[label_column].fillna("").astype(str)
 
-    # Use the SAME sharding as build_concept_matrix (concepts.py):
-    # sample(frac=1, random_state=42) then sequential split, so embedding
-    # shards contain exactly the same proteins in the same order as concept shards.
+    # Same sharding as build_concept_matrix so shards align.
     if n_shards > 1:
-        import numpy as _np
-        df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-        _shard_size = int(_np.ceil(len(df) / n_shards))
-        shards = [df.iloc[i:i + _shard_size].reset_index(drop=True)
-                  for i in range(0, len(df), _shard_size)]
+        shards = shuffled_shards(df, n_shards)
         for shard_id, shard_df in enumerate(shards):
             shard_seqs = shard_df[sequence_column].tolist()
             shard_dir = output_dir / f"shard_{shard_id}"
@@ -95,9 +100,9 @@ def extract_embeddings(
                     shard_seqs, layer=layer, batch_size=batch_size
                 )
                 result = {"embeddings": result}
-            torch.save(result, shard_dir / "activations.pt")
+            torch.save(result, shard_dir / "embeddings.pt")
 
-            print(f"Shard {shard_id}: {result['embeddings'].shape[0]} tokens → {shard_dir / 'activations.pt'}")
+            print(f"Shard {shard_id}: {result['embeddings'].shape[0]} tokens → {shard_dir / 'embeddings.pt'}")
     else:
         if has_labels:
             result = embedder.extract_embeddings_with_labels(
@@ -109,9 +114,9 @@ def extract_embeddings(
                 sequences, layer=layer, batch_size=batch_size
             )
             result = {"embeddings": result}
-        torch.save(result, output_dir / "activations.pt")
+        torch.save(result, output_dir / "embeddings.pt")
 
-        print(f"Saved {result['embeddings'].shape[0]} tokens to {output_dir / 'activations.pt'}")
+        print(f"Saved {result['embeddings'].shape[0]} tokens to {output_dir / 'embeddings.pt'}")
 
     print("Done!")
 
@@ -134,5 +139,9 @@ if __name__ == "__main__":
     parser.add_argument("--n_shards", type=int, default=5, help="Number of shards to split data into")
     parser.add_argument("--label_map", type=str, default="mBMRB",
                         help="Label encoding preset name or path to YAML label-map file")
+    parser.add_argument("--min_seq_len", type=int, default=0,
+                        help="Drop sequences shorter than this (must match concept build)")
+    parser.add_argument("--max_seq_len", type=int, default=10000,
+                        help="Drop sequences longer than this (must match concept build)")
     args = parser.parse_args()
     extract_embeddings(**vars(args))

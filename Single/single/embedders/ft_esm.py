@@ -35,14 +35,16 @@ class FineTunedESMEmbedder:
         self._load_model()
 
     def _load_model(self):
+        # The fine-tuned backbones (e.g. Synthyra/ESM2-8M via FastPLMs) ship custom
+        # code in config.json (auto_map), so trust_remote_code=True is required.
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.ckpt_path, local_files_only=True
+            self.ckpt_path, local_files_only=True, trust_remote_code=True
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token or "<pad>"
 
         self.model = AutoModelForTokenClassification.from_pretrained(
-            self.ckpt_path, local_files_only=True
+            self.ckpt_path, local_files_only=True, trust_remote_code=True
         )
         self.model = self.model.to(self.device)
         self.model.eval()

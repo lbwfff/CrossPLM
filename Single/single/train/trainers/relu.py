@@ -121,3 +121,40 @@ class ReLUTrainer(SAETrainer):
                 self.ae.encoder.weight.data[dead_neurons].T
             )
             self.steps_since_active[dead_neurons] = 0
+
+            # Reset the corresponding Adam optimizer state (exp_avg / exp_avg_sq /
+            # step) for the resampled rows/columns. Otherwise the newly-initialized
+            # neurons keep the stale momentum from their previous (dead) weights,
+            # which slows convergence of the resampled features.
+            self._reset_optimizer_state_for(dead_neurons)
+
+    def _reset_optimizer_state_for(self, dead_neurons: t.Tensor):
+        """Zero the Adam state for the encoder rows / decoder columns being resampled."""
+        dead_idx = dead_neurons.nonzero(as_tuple=False).flatten().tolist()
+        if not dead_idx:
+            return
+        # optimizer.params order matches ae.parameters() order:
+        #   0: bias, 1: encoder.weight, 2: encoder.bias, 3: decoder.weight
+        for p_idx, p in enumerate(self.optimizer.param_groups[0]["params"]):
+            state = self.optimizer.state.get(p)
+            if not state:
+                continue
+            # Only reset state for parameters that actually had rows/columns
+            # resampled (encoder.weight / encoder.bias / decoder.weight). The
+            # pre-encoding bias (p_idx 0) is untouched and keeps its state.
+            if p_idx not in (1, 2, 3):
+                continue
+            for key in ("exp_avg", "exp_avg_sq"):
+                if key not in state:
+                    continue
+                s = state[key]
+                if p_idx == 1:  # encoder.weight [dict_size, act_dim] — reset rows
+                    s[dead_idx] = 0.0
+                elif p_idx == 2:  # encoder.bias [dict_size] — reset rows
+                    s[dead_idx] = 0.0
+                elif p_idx == 3:  # decoder.weight [act_dim, dict_size] — reset cols
+                    s[:, dead_idx] = 0.0
+            # Reset the step counter in-place (it is a torch scalar tensor, NOT a
+            # Python int; assigning an int breaks optimizer.step()).
+            if "step" in state:
+                state["step"].zero_()

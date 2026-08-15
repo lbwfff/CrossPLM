@@ -54,7 +54,9 @@ class TokenClassificationDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.label_map = label_map or build_label_map(labels)
-        self.num_labels = len(self.label_map)
+        # Number of DISTINCT classes (many chars may map to one class), NOT the
+        # number of characters in the map.
+        self.num_labels = label_map_n_classes(self.label_map)
 
     def __len__(self):
         return len(self.sequences)
@@ -139,18 +141,17 @@ def load_data_from_csv(
     sequence_column: str = "sequence",
     label_column: str = "label",
 ) -> Tuple[List[str], List[str]]:
-    import csv
-    sequences, labels = [], []
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            seq = row[sequence_column].strip().upper()
-            lbl = row[label_column].strip()
-            if len(seq) != len(lbl):
-                continue
-            sequences.append(seq)
-            labels.append(lbl)
-    return sequences, labels
+    """Load sequences + labels from a CSV/TSV using the given column names.
+
+    Delegates to single.label_maps.load_labeled_sequences so Training and the
+    interpretability module read datasets with the exact same logic (separator
+    auto-detection, uppercased sequences, rows with mismatched lengths dropped).
+    """
+    from single.label_maps import load_labeled_sequences
+
+    return load_labeled_sequences(
+        csv_path, {"sequence_column": sequence_column, "label_column": label_column}
+    )
 
 
 def split_dataset(dataset: Dataset, train_ratio: float, seed: int = 42):

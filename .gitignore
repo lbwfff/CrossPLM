@@ -20,7 +20,7 @@ env/
 *.swp
 *.swo
 
-# Training artifacts
+# Training artifacts (model weights are ignored via *.safetensors/*.bin)
 Training/outputs/
 
 # Preprocessed data (can be regenerated from Dataset/ raw files)

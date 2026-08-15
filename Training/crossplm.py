@@ -1,30 +1,73 @@
 #!/usr/bin/env python3
 """CrossPLM Training CLI
 
-Usage:
-  python crossplm.py init --task_name my_experiment
-  python crossplm.py train --config outputs/tasks/my_experiment_<ts>/config.yaml
-  python crossplm.py eval --checkpoint outputs/tasks/xxx/checkpoints/xxx --csv ./data.csv
+Run from the repository root (no cd needed):
+
+  python Training/crossplm.py init --task_name my_experiment
+  python Training/crossplm.py train --config Outputs/my_experiment/config.yaml
+  python Training/crossplm.py eval --checkpoint Outputs/my_experiment/checkpoints/xxx --csv Dataset/mBMRB.csv
 """
 import os
 import sys
 import argparse
+from pathlib import Path
+
+
+def _load_label_map(name):
+    """Load a label-map spec (preset name or YAML file path).
+
+    Uses the SAME label maps as the interpretability module
+    (Single/single/label_maps.py, made importable by crossplm/__init__.py) so
+    Training and Single interpret a dataset's per-residue labels identically.
+    The spec carries the sequence/label column names, the char->class mapping,
+    and ignore characters.
+
+    Relative YAML paths are resolved against the Training module directory (like
+    csv_data_path), so the result does not depend on the current working dir.
+    """
+    from single.label_maps import get_label_map
+
+    p = Path(name)
+    if p.suffix in {".yaml", ".yml"} and not p.is_absolute():
+        p = Path(os.path.dirname(os.path.abspath(__file__))) / p
+    return get_label_map(str(p))
+
+
+def cmd_labelmap(args):
+    """Create an empty label-map YAML template in the repo's Dataset/ dir."""
+    import crossplm  # noqa: F401  (crossplm/__init__.py puts Single/ on sys.path)
+    from single.label_maps import generate_template
+
+    if args.output:
+        out = Path(args.output)
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        out = Path(script_dir).parent / "Dataset" / f"{args.name}.yaml"
+    path = generate_template(out)
+    rel = os.path.relpath(path, os.path.dirname(os.path.abspath(__file__)))
+    print(f"[Label Map Template] {path}")
+    print(f"Edit it, then reference it via config 'label_map: {rel}' or "
+          f"'--label_map {rel}' (relative to Training/).")
 
 
 def cmd_init(args):
     from crossplm import TrainingConfig, create_task_folder
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(script_dir, "outputs", "tasks")
+    # Shared top-level output root (same as the interpretability module):
+    # <repo>/Outputs/<task_name>/  (verbatim, no timestamp)
+    output_dir = os.path.join(script_dir, "..", "Outputs")
     task_dir = create_task_folder(output_dir, args.task_name)
 
     config_path = os.path.join(task_dir, "config.yaml")
+    if os.path.exists(config_path):
+        print(f"[WARNING] {task_dir} already exists — overwriting config.yaml")
     TrainingConfig.generate_template(config_path)
 
     print(f"[Task Created] {task_dir}")
     print(f"[Config Template] {config_path}")
-    print(f"Edit the config, then run:")
-    print(f"  python crossplm.py train --config {config_path}")
+    print(f"Edit the config, then run (from the repository root):")
+    print(f"  python Training/crossplm.py train --config {config_path}")
 
 
 def cmd_train(args):
@@ -59,32 +102,35 @@ def cmd_train(args):
     if not os.path.isabs(csv_path):
         csv_path = os.path.join(script_dir, csv_path)
 
+    # Unified label map (same as Single): a preset name ("mBMRB", "relaxdb",
+    # "ss3") or a YAML file. The spec can also define which columns hold the
+    # sequence and the label string. Without it we fall back to the config's
+    # columns and infer the map from the CSV (legacy behavior).
+    spec = None
+    label_map = None
+    if config.label_map:
+        spec = _load_label_map(config.label_map)
+        label_map = dict(spec["mapping"])
+        seq_col = spec.get("sequence_column") or config.sequence_column
+        lbl_col = spec.get("label_column") or config.label_column
+        print(f"  Label map (from '{config.label_map}'): {label_map}")
+    else:
+        seq_col, lbl_col = config.sequence_column, config.label_column
+
     print(f"[Loading CSV] {csv_path}")
     sequences, labels = load_data_from_csv(
         csv_path,
-        sequence_column=config.sequence_column,
-        label_column=config.label_column,
+        sequence_column=seq_col,
+        label_column=lbl_col,
     )
     print(f"  Total samples: {len(sequences)}")
     if len(sequences) == 0:
         print("ERROR: No valid data loaded. Check CSV path and column names.")
         sys.exit(1)
 
-    # Use an explicit label-map preset/YAML if configured (consistent with the
-    # interpretability module), otherwise infer from the CSV with sorted(unique).
-    label_map = None
-    if config.label_map:
-        try:
-            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Single"))
-            from single.label_maps import get_label_map
-            spec = get_label_map(config.label_map)
-            label_map = dict(spec["mapping"])
-        except Exception as e:
-            print(f"  WARNING: could not load label_map '{config.label_map}': {e}")
-            print("  Falling back to inferring label map from CSV.")
     if label_map is None:
         label_map = build_label_map(labels)
-    print(f"  Label map: {label_map}")
+        print(f"  Label map (inferred from CSV): {label_map}")
 
     print(f"[Loading backbone model] {config.backbone_model_id}")
     n_classes = label_map_n_classes(label_map)
@@ -160,27 +206,52 @@ def cmd_eval(args):
         tokenizer.pad_token = tokenizer.eos_token or "<pad>"
 
     print(f"[Loading CSV] {csv_path}")
-    sequences, labels = load_data_from_csv(csv_path)
+    seq_col = args.sequence_column
+    lbl_col = args.label_column
+
+    # Explicit --label_map (preset/YAML, same as Single) wins; it may also define
+    # the CSV columns. Otherwise use the training-time map persisted in the
+    # checkpoint, falling back to the eval CSV only for legacy checkpoints.
+    label_map = None
+    if args.label_map:
+        spec = _load_label_map(args.label_map)
+        label_map = dict(spec["mapping"])
+        seq_col = spec.get("sequence_column") or seq_col
+        lbl_col = spec.get("label_column") or lbl_col
+        print(f"  Label map (from '{args.label_map}'): {label_map}")
+
+    sequences, labels = load_data_from_csv(csv_path, sequence_column=seq_col, label_column=lbl_col)
     print(f"  samples: {len(sequences)}")
 
-    # Prefer the training-time label map persisted in the checkpoint config.
-    # label2id is the complete {char: class_id} map (many chars may map to one
-    # class), so it is the correct source. id2label is only class_id -> a single
-    # representative char and is NOT sufficient to re-derive the full mapping.
-    # Fall back to rebuilding from the eval CSV only for legacy checkpoints.
-    cfg_label2id = getattr(model.config, "label2id", None)
-    # Guard against HF placeholder maps like {"LABEL_0":0, "LABEL_1":1}, which
-    # are auto-generated and are not the training-time mapping.
-    is_hf_placeholder = (
-        cfg_label2id is not None
-        and all(str(k).startswith("LABEL_") for k in cfg_label2id)
-    )
-    if cfg_label2id and not is_hf_placeholder and all(str(v) != "None" for v in cfg_label2id.values()):
-        label_map = {str(k): int(v) for k, v in cfg_label2id.items()}
-        print(f"  Label map (from checkpoint): {label_map}")
-    else:
-        label_map = build_label_map(labels)
-        print(f"  Label map (rebuilt from eval CSV): {label_map}")
+    if label_map is None:
+        # Priority: sidecar label_map.json (written by train) > model.config.label2id
+        # > rebuild from the eval CSV (legacy). The FastEsm runtime drops
+        # num_labels/id2label/label2id from config.json, so the sidecar is the
+        # reliable source for the training-time mapping.
+        sidecar = os.path.join(ckpt_path, "label_map.json")
+        if os.path.exists(sidecar):
+            with open(sidecar) as f:
+                lm = json.load(f)
+            label_map = {str(k): int(v) for k, v in lm.get("label2id", {}).items()}
+            print(f"  Label map (from checkpoint label_map.json): {label_map}")
+        else:
+            # label2id is the complete {char: class_id} map persisted at training time
+            # (many chars may map to one class), so it is the correct source.
+            # id2label is only class_id -> a single representative char and is NOT
+            # sufficient to re-derive the full mapping.
+            cfg_label2id = getattr(model.config, "label2id", None)
+            # Guard against HF placeholder maps like {"LABEL_0":0, "LABEL_1":1}, which
+            # are auto-generated and are not the training-time mapping.
+            is_hf_placeholder = (
+                cfg_label2id is not None
+                and all(str(k).startswith("LABEL_") for k in cfg_label2id)
+            )
+            if cfg_label2id and not is_hf_placeholder and all(str(v) != "None" for v in cfg_label2id.values()):
+                label_map = {str(k): int(v) for k, v in cfg_label2id.items()}
+                print(f"  Label map (from checkpoint): {label_map}")
+            else:
+                label_map = build_label_map(labels)
+                print(f"  Label map (rebuilt from eval CSV): {label_map}")
 
     n_classes = label_map_n_classes(label_map)
     dataset = TokenClassificationDataset(
@@ -258,9 +329,12 @@ def cmd_eval(args):
 
     output_dir = args.output
     if output_dir is None:
+        # Default: <experiment>/evaluations/<csv_name>/  (the checkpoint is
+        # <experiment>/checkpoints/<ckpt>, so the experiment dir is two levels up).
         ckpt_dir = os.path.dirname(os.path.normpath(args.checkpoint))
+        task_dir = os.path.dirname(ckpt_dir)
         csv_name = os.path.splitext(os.path.basename(args.csv))[0]
-        output_dir = os.path.join(ckpt_dir, f"eval_on_{csv_name}")
+        output_dir = os.path.join(task_dir, "evaluations", csv_name)
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -320,6 +394,13 @@ def main():
     p_init = sub.add_parser("init", help="Create task folder and config template")
     p_init.add_argument("--task_name", type=str, required=True)
 
+    p_labelmap = sub.add_parser("labelmap",
+                                help="Create an empty label-map YAML template (Dataset/)")
+    p_labelmap.add_argument("--name", type=str, required=True,
+                            help="Base name, e.g. my_dataset -> Dataset/my_dataset.yaml")
+    p_labelmap.add_argument("--output", type=str, default=None,
+                            help="Explicit output path (default: Dataset/<name>.yaml)")
+
     p_train = sub.add_parser("train", help="Start training from a config.yaml")
     p_train.add_argument("--config", type=str, required=True)
 
@@ -327,14 +408,22 @@ def main():
     p_eval.add_argument("--checkpoint", type=str, required=True)
     p_eval.add_argument("--csv", type=str, required=True)
     p_eval.add_argument("--output", type=str, default=None,
-                        help="Output directory (default: <checkpoint_dir>/eval_on_<csv_name>)")
+                        help="Output directory (default: <experiment>/evaluations/<csv_name>)")
     p_eval.add_argument("--batch_size", type=int, default=8)
     p_eval.add_argument("--max_seq_length", type=int, default=512)
+    p_eval.add_argument("--label_map", type=str, default=None,
+                        help="Label-map preset (mBMRB/relaxdb/ss3) or YAML file, "
+                             "same as the interpretability module. Overrides the "
+                             "checkpoint's persisted label map.")
+    p_eval.add_argument("--sequence_column", type=str, default="sequence")
+    p_eval.add_argument("--label_column", type=str, default="label")
 
     args = parser.parse_args()
 
     if args.command == "init":
         cmd_init(args)
+    elif args.command == "labelmap":
+        cmd_labelmap(args)
     elif args.command == "train":
         cmd_train(args)
     elif args.command == "eval":

@@ -5,9 +5,18 @@ Visualize SAE feature activations on protein sequences.
 Usage:
     python scripts/visualize_features.py \
         --sae_dir ../models/sae/layer_6 \
-        --embeddings_path ../data/embeddings/esm2_8m/layer_6/activations.pt \
+        --embeddings_path ../data/embeddings/esm2_8m/layer_6/embeddings.pt \
         --output_dir ../analysis_results/visualizations
 """
+
+import os
+import sys
+
+# Allow running directly from the repository root, e.g.
+#   python Single/single/scripts/analyze_sequence.py ...
+# without `cd Single` or installing the package (the `single` package lives at
+# Single/single/, two levels up from this file).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 import argparse
 from pathlib import Path
@@ -126,7 +135,7 @@ def plot_feature_summary(
 
 
 def visualize_features(
-    sae_dir: Path,
+    sae_dir: Optional[Path] = None,
     embeddings_path: Optional[Path] = None,
     output_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
@@ -141,12 +150,21 @@ def visualize_features(
     layer: int = 6,
     shard: int = 0,
     max_length: int = 512,
+    min_seq_len: int = 0,
+    max_seq_len: int = 10_000,
 ):
     from single.paths import resolve_experiment
 
-    if experiment is None and exp_dir is None and embeddings_path is None:
-        raise ValueError("Must provide --embeddings_path, or --experiment/--exp_dir")
+    if experiment is None and exp_dir is None and embeddings_path is None and output_dir is None:
+        raise ValueError("Must provide --experiment/--exp_dir (or an explicit path)")
     exp = resolve_experiment(exp_dir=exp_dir, name=experiment) if (experiment or exp_dir) else None
+
+    # --sae_dir defaults into Outputs/<experiment>/sae but stays overridable.
+    if sae_dir is None:
+        if exp is None:
+            raise ValueError("--sae_dir required when no experiment is given")
+        sae_dir = exp.sae_dir
+        print(f"  SAE dir (inferred): {sae_dir}")
 
     # Prefer explicit output_dir; else route into the experiment dir.
     if output_dir is None:
@@ -158,10 +176,10 @@ def visualize_features(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Infer embeddings path from experiment if not given:
-    # Outputs/<exp>/embeddings/layer_<N>/shard_<S>/activations.pt
+    # Outputs/<exp>/embeddings/layer_<N>/shard_<S>/embeddings.pt
     if embeddings_path is None:
         emb_dir = exp.embeddings_dir(layer=layer) / f"shard_{shard}"
-        embeddings_path = emb_dir / "activations.pt"
+        embeddings_path = emb_dir / "embeddings.pt"
         print(f"Inferred embeddings path: {embeddings_path}")
     embeddings_path = Path(embeddings_path)
 
@@ -189,26 +207,19 @@ def visualize_features(
     # given shard contains no labels, we skip label overlay for that protein.
     boundaries = []
     if sequences_csv:
-        import pandas as pd
-        import numpy as _np
-        with open(sequences_csv, "r") as _f:
-            _first = _f.readline()
-        _sep = "\t" if _first.count("\t") > _first.count(",") else ","
-        df = pd.read_csv(sequences_csv, sep=_sep, low_memory=False)
-        df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+        from single.data import load_sequences_df, shuffled_shards
+
+        df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
+                               min_seq_len=min_seq_len, max_seq_len=max_seq_len)
 
         # Determine shard count from the embeddings directory (for the given layer).
         n_shards = len(list(exp.embeddings_dir(layer=layer).glob("shard_*"))) if exp else 1
         max_residues = max_length - 2
 
+        # Shared shuffle+shard (fixed seed) — identical to extract_embeddings.
         if n_shards > 1:
-            _shard_size = int(_np.ceil(len(df) / n_shards))
-            shards = [df.iloc[i:i + _shard_size].reset_index(drop=True)
-                      for i in range(0, len(df), _shard_size)]
-            if shard < len(shards):
-                shard_df = shards[shard]
-            else:
-                shard_df = df.iloc[:0]  # empty
+            shards = shuffled_shards(df, n_shards)
+            shard_df = shards[shard] if shard < len(shards) else df.iloc[:0]
         else:
             shard_df = df
 
@@ -261,10 +272,11 @@ def visualize_features(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize SAE feature activations on proteins")
-    parser.add_argument("--sae_dir", type=Path, required=True)
+    parser.add_argument("--sae_dir", type=Path, default=None,
+                        help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     parser.add_argument("--embeddings_path", type=Path, default=None,
                         help="Embeddings shard file (default: inferred from experiment "
-                             "as embeddings/layer_<N>/shard_<S>/activations.pt)")
+                             "as embeddings/layer_<N>/shard_<S>/embeddings.pt)")
     parser.add_argument("--experiment", type=str, default=None,
                         help="Experiment name; routes outputs into Outputs/<experiment>/")
     parser.add_argument("--exp_dir", type=Path, default=None,
@@ -278,6 +290,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=512,
                         help="Embedder max_length used at extraction (boundaries truncated "
                              "to max_length-2)")
+    parser.add_argument("--min_seq_len", type=int, default=0,
+                        help="Must match extract_embeddings --min_seq_len")
+    parser.add_argument("--max_seq_len", type=int, default=10000,
+                        help="Must match extract_embeddings --max_seq_len")
     parser.add_argument("--sequences_csv", type=Path, default=None)
     parser.add_argument("--sequence_column", type=str, default="sequence")
     parser.add_argument("--label_column", type=str, default=None)

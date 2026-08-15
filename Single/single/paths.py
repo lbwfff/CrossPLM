@@ -4,9 +4,9 @@ Centralized output path management for the SAE interpretability pipeline.
 All scripts write into a single experiment directory:
 
     Outputs/<experiment>/
-        embeddings/layer_<N>/shard_<i>/activations.pt
-        sae/ae.pt
-        concepts/shard_<i>/aa_concepts.npz
+        embeddings/layer_<N>/shard_<i>/embeddings.pt
+        sae/model.pt
+        concepts/shard_<i>/concept_matrix.npz
         analysis/...
 
 Usage:
@@ -20,13 +20,17 @@ Usage:
 
 The experiment name is used verbatim as the directory name (no timestamp), so a
 given `--experiment <name>` always routes to the SAME `Outputs/<name>/`. Re-running
-a step with the same name reuses the existing directory (e.g. overwriting ae.pt).
+a step with the same name reuses the existing directory (e.g. overwriting model.pt).
 Use distinct experiment names for distinct runs. `--exp_dir <path>` uses that path
 verbatim.
 """
 
 from pathlib import Path
 from typing import Optional
+
+# Top-level output root shared with the Training module: <repo>/Outputs/.
+# Resolved from this file's location so it works regardless of the CWD.
+_DEFAULT_ROOT = Path(__file__).resolve().parents[2] / "Outputs"
 
 
 class Experiment:
@@ -35,7 +39,7 @@ class Experiment:
     def __init__(
         self,
         name: str,
-        root: Path = Path("../Outputs"),
+        root: Path = _DEFAULT_ROOT,
     ):
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
@@ -87,11 +91,15 @@ class Experiment:
     # ---- convenience accessors ----
     @property
     def sae_model_path(self) -> Path:
-        return self.sae_dir / "ae.pt"
+        return self.sae_dir / "model.pt"
+
+    @property
+    def sae_normalized_path(self) -> Path:
+        return self.sae_dir / "model_normalized.pt"
 
     @property
     def concept_columns_path(self) -> Path:
-        return self.concepts_dir / "aa_concepts_columns.txt"
+        return self.concepts_dir / "concept_columns.txt"
 
     @property
     def concept_pairs_csv(self) -> Path:
@@ -108,7 +116,7 @@ class Experiment:
 def resolve_experiment(
     exp_dir: Optional[Path] = None,
     name: Optional[str] = None,
-    root: Path = Path("../Outputs"),
+    root: Path = _DEFAULT_ROOT,
 ) -> Experiment:
     """
     Build an Experiment from either an existing experiment directory or a name.

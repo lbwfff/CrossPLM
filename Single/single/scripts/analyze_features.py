@@ -10,6 +10,15 @@ Usage:
         --label_column label
 """
 
+import os
+import sys
+
+# Allow running directly from the repository root, e.g.
+#   python Single/single/scripts/analyze_sequence.py ...
+# without `cd Single` or installing the package (the `single` package lives at
+# Single/single/, two levels up from this file).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
 import argparse
 from pathlib import Path
 from typing import Optional
@@ -31,23 +40,30 @@ from single.analysis.feature_alignment import (
 
 
 def analyze_features(
-    sae_dir: Path,
     embeddings_dir: Path,
     output_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
     label_column: Optional[str] = None,
     sequences_csv: Optional[Path] = None,
+    sequence_column: str = "sequence",
     activation_threshold: float = 0.05,
     n_top_features: int = 50,
     label_map: str = "mBMRB",
     max_length: int = 512,
+    sae_dir: Optional[Path] = None,
 ):
     from single.paths import resolve_experiment
 
-    # Prefer explicit output_dir (legacy); else route into the experiment dir.
-    if output_dir is None:
+    # --sae_dir and --output_dir default into Outputs/<experiment>/, but both
+    # remain overridable explicitly.
+    exp = None
+    if sae_dir is None or output_dir is None:
         exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+    if sae_dir is None:
+        sae_dir = exp.sae_dir
+        print(f"  SAE dir (inferred): {sae_dir}")
+    if output_dir is None:
         output_dir = exp.analysis_dir
         print(f"Experiment dir: {exp.dir}")
     output_dir = Path(output_dir)
@@ -85,7 +101,7 @@ def analyze_features(
         else:
             embeddings = data.to(device)
     else:
-        pt_files = sorted(data_path.glob("**/activations.pt"))
+        pt_files = sorted(data_path.glob("**/embeddings.pt"))
         all_embeddings, all_labels = [], []
         for f in pt_files:
             d = torch.load(f, map_location="cpu", weights_only=True)
@@ -109,20 +125,17 @@ def analyze_features(
     # embeddings, we must replicate that exact shuffle+shard here.
     if labels is None and sequences_csv is not None and label_column is not None:
         print("\n3. Parsing labels from CSV (replicating extract_embeddings shuffle+shard)...")
-        with open(sequences_csv, "r") as _f:
-            _first = _f.readline()
-        _sep = "\t" if _first.count("\t") > _first.count(",") else ","
-        df = pd.read_csv(sequences_csv, sep=_sep, low_memory=False)
+        from single.data import load_sequences_df, shuffled_shards
+        df = load_sequences_df(sequences_csv, sequence_column=sequence_column)
         df[label_column] = df[label_column].fillna("").astype(str)
-        if "sequence" not in df.columns:
+        if sequence_column not in df.columns:
             raise ValueError(
-                "CSV must contain a 'sequence' column to align labels with "
+                f"CSV must contain a '{sequence_column}' column to align labels with "
                 "truncated embeddings (sequences longer than max_length-2 are "
                 "truncated by the embedder)."
             )
 
         from single.label_maps import encode_label_string
-        import numpy as _np
 
         # Max residues kept per protein by the embedder (CLS + EOS take 2 slots).
         max_residues = max_length - 2  # default 512 -> 510
@@ -134,8 +147,7 @@ def analyze_features(
         else:
             n_shards = 1
 
-        # Replicate extract_embeddings.py: sample(frac=1, random_state=42) then split.
-        df_shuf = df.sample(frac=1, random_state=42).reset_index(drop=True)
+        # Shared shuffle+shard (fixed seed) — identical to extract_embeddings.
         all_labels = []
 
         def _encode_truncated(seq, label_str):
@@ -145,18 +157,15 @@ def analyze_features(
             return encode_label_string(truncated, label_map_spec)
 
         if n_shards > 1:
-            _shard_size = int(_np.ceil(len(df_shuf) / n_shards))
-            shards = [df_shuf.iloc[i:i + _shard_size].reset_index(drop=True)
-                      for i in range(0, len(df_shuf), _shard_size)]
-            for shard_df in shards:
-                for seq, label_str in zip(tqdm(shard_df["sequence"],
+            for shard_df in shuffled_shards(df, n_shards):
+                for seq, label_str in zip(tqdm(shard_df[sequence_column],
                                                 desc="Parsing labels"),
                                           shard_df[label_column]):
                     all_labels.extend(_encode_truncated(seq, label_str))
         else:
-            for seq, label_str in zip(tqdm(df_shuf["sequence"],
+            for seq, label_str in zip(tqdm(df[sequence_column],
                                           desc="Parsing labels"),
-                                      df_shuf[label_column]):
+                                      df[label_column]):
                 all_labels.extend(_encode_truncated(seq, label_str))
 
         labels = torch.tensor(all_labels, device=device)
@@ -250,8 +259,8 @@ def analyze_features(
 
     # Save normalized model
     sae_normalized = normalize_sae_features(sae, max_per_feat)
-    torch.save(sae_normalized.state_dict(), sae_dir / "ae_normalized.pt")
-    print(f"   Normalized model saved to {sae_dir / 'ae_normalized.pt'}")
+    torch.save(sae_normalized.state_dict(), sae_dir / "model_normalized.pt")
+    print(f"   Normalized model saved to {sae_dir / 'model_normalized.pt'}")
 
     print(f"\n{'=' * 60}")
     print(f"Analysis complete! Results in {output_dir}")
@@ -260,7 +269,8 @@ def analyze_features(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze SAE features against task labels")
-    parser.add_argument("--sae_dir", type=Path, required=True)
+    parser.add_argument("--sae_dir", type=Path, default=None,
+                        help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     parser.add_argument("--embeddings_dir", type=Path, required=True)
     parser.add_argument("--experiment", type=str, default=None,
                         help="Experiment name; creates Outputs/<experiment>_<ts>/")
@@ -270,6 +280,7 @@ if __name__ == "__main__":
                         help="Explicit output dir (overrides experiment routing)")
     parser.add_argument("--sequences_csv", type=Path, default=None, help="CSV with label column")
     parser.add_argument("--label_column", type=str, default=None)
+    parser.add_argument("--sequence_column", type=str, default="sequence")
     parser.add_argument("--activation_threshold", type=float, default=0.05)
     parser.add_argument("--n_top_features", type=int, default=50)
     parser.add_argument("--label_map", type=str, default="mBMRB",
