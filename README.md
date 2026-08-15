@@ -2,18 +2,32 @@
 
 **Mechanistic Interpretability for Cross-Task Protein Language Models**
 
-Protein language models (PLMs) perform well on diverse biological tasks, but their internal mechanisms are not yet fully understood. This project builds an interpretability framework for cross-task PLMs, including a fine-tuning toolkit and a SAE-based interpretability module.
+Protein language models (PLMs) perform well on diverse biological tasks, but their internal mechanisms are not yet fully understood. This project builds an interpretability framework for cross-task PLMs, consisting of a **fine-tuning toolkit** (Training) and a **SAE-based interpretability module** (Single), with a cross-model module (Crossing) planned.
 
 ---
 
-## Project Structure
+## Overview
+
+```
+Dataset/  Preprocessing/   Training/        Single/        Outputs/
+ (raw)        →         fine-tune a PLM → SAE analysis → per-experiment results
+```
+
+| Directory | Role |
+|-----------|------|
+| `Dataset/` | Raw datasets (`mBMRB.csv`, `relaxdb_data.csv`) |
+| `Preprocessing/` | Dataset-specific label preprocessing scripts |
+| `Training/` | PLM fine-tuning framework (init / train / eval CLI) |
+| `Single/` | SAE-based interpretability: extract → train SAE → analyze |
+| `Outputs/` | All per-experiment outputs (embeddings, SAE, concepts, analysis) |
+| `Crossing/` | Planned: cross-model interpretability (not yet implemented) |
 
 ```
 CrossPLM/
 ├── Dataset/                     # Raw datasets
 │   ├── relaxdb_data.csv
 │   └── mBMRB.csv
-├── Preprocessing/               # Dataset-specific preprocessing scripts
+├── Preprocessing/               # Dataset preprocessing scripts
 │   ├── preprocess_relaxdb.py
 │   └── preprocess_mbmrb.py
 ├── Training/                    # PLM training framework
@@ -21,7 +35,7 @@ CrossPLM/
 │   ├── crossplm/                # Python package
 │   ├── outputs/                 # Training outputs (checkpoints, logs)
 │   └── examples/                # Sample data and configs
-├── Single/                      # ★ SAE-based interpretability
+├── Single/                      # SAE-based interpretability
 │   ├── setup.py
 │   └── single/
 │       ├── configs.py           # Configuration dataclasses
@@ -39,7 +53,10 @@ CrossPLM/
 
 ---
 
-## Training: Fine-tune a PLM
+## Module 1: Training — Fine-tune a PLM
+
+Fine-tunes a HuggingFace protein language model (e.g. ESM-2) on a per-residue
+token-classification task (e.g. backbone dynamics: rigid vs flexible).
 
 ### 0. Preprocess Data
 ```bash
@@ -70,11 +87,27 @@ python crossplm.py eval \
 ```
 → Results (metrics.json, confusion matrix, AUPRC curve) are saved inside the task folder.
 
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Two-phase workflow** | init (template) → train, keeping config separate from code |
+| **CSV input** | `sequence` + `label` columns, automatic train/eval split |
+| **Ignore positions** | `_` labels are excluded from loss |
+| **Auto class weights** | `inverse` / `log` / `none` strategies |
+| **Multi-class support** | Correct class count for many-to-one label maps (mBMRB, relaxdb, ss3) |
+| **Metrics** | Loss + Accuracy + Macro F1 + AUPRC (macro over all classes) |
+| **Top-3 checkpoints** | Keeps best 3 by F1, cleans old ones automatically |
+| **Training curve** | Auto-generated epoch–F1 plot after training |
+| **Eval plots** | Confusion matrix + Precision-Recall curve |
+
 ---
 
-## Interpretability: SAE Feature Analysis
+## Module 2: Interpretability — SAE Analysis (Single/)
 
-After fine-tuning a PLM, use Sparse Autoencoders to discover which hidden-state features drive the model's predictions.
+After fine-tuning a PLM, use **Sparse Autoencoders** to discover which hidden-state
+features drive the model's predictions, and interpret them against either the task
+labels or Swiss-Prot biological concepts.
 
 ### Pipeline
 
@@ -85,18 +118,21 @@ Fine-tuned PLM checkpoint
          ↓
 [2] train_sae.py             → Train a Sparse Autoencoder to learn interpretable features
          ↓
-[3] analyze_features.py     → Align each SAE feature with task labels (rigid/flexible)
+[3] analyze_features.py     → (A) Align features with task labels   (rigid/flexible)
+[4] analyze_concepts.py     → (B) Align features with biological concepts (Swiss-Prot)
          ↓
-[4] visualize_features.py   → Plot feature activation patterns on protein sequences
+[5] heldout / fidelity      → (C) Validate the findings (unbiased, faithful)
+         ↓
+[6] visualize_features.py   → Plot feature activation patterns on protein sequences
 ```
 
-### How it Works
+### How SAEs Work
 
 SAEs learn a sparse, overcomplete decomposition of PLM hidden states:
 
 ```
 ESM hidden state (320-dim)  →  SAE encoder  →  sparse feature vector (640-dim)
-                                                   ↑ only ~18 features active per token
+                                                   ↑ only ~60 features active per token
 ```
 
 Each feature can then be interpreted by checking **when** it activates:
@@ -104,11 +140,12 @@ Each feature can then be interpreted by checking **when** it activates:
 - Does it activate on **rigid** residues? → "rigidity detector"
 - Is it unrelated to the task? → noise feature
 
-### Usage
+### Shared Conventions
 
-All outputs are organized under a single **experiment directory**. Pick an
-experiment name (or reuse one with `--exp_dir`) and every step routes its
-output into the same tree:
+**Experiment directory.** Every step routes outputs into one directory,
+`Outputs/<experiment>/` (the name is used verbatim, no timestamp). Re-running a step
+with the same name reuses the directory (e.g. overwrites `ae.pt`). Use distinct
+names for distinct runs, or `--exp_dir <existing_dir>` to point at one directly.
 
 ```
 Outputs/<experiment>/
@@ -118,92 +155,8 @@ Outputs/<experiment>/
     analysis/*.csv|*.json|visualizations/
 ```
 
-```bash
-cd Single
-
-# 1. Extract hidden states from fine-tuned model (creates Outputs/mb/)
-python -m single.scripts.extract_embeddings \
-    --ckpt_path ../Training/outputs/tasks/my_task/checkpoints/best \
-    --sequences_csv ../Dataset/mBMRB.csv \
-    --experiment mb \
-    --label_column label --label_map mBMRB
-
-# 2. Train SAE (320-dim → 640 sparse features; embeddings_dir inferred from experiment,
-#    uses ALL shards by default. --shard N restricts to one shard.)
-python -m single.scripts.train_sae \
-    --experiment mb \
-    --batch_size 64 --dict_size 640 --steps 20000 --l1_penalty 0.08 \
-    --resample_steps 2000
-
-# 3. Align features with task labels
-python -m single.scripts.analyze_features \
-    --sae_dir ../Outputs/mb/sae \
-    --embeddings_dir ../Outputs/mb/embeddings/layer_6 \
-    --experiment mb \
-    --sequences_csv ../Dataset/mBMRB.csv --label_column label --label_map mBMRB
-
-# 4. Visualize top features on sequences (embeddings_path inferred from experiment)
-python -m single.scripts.visualize_features \
-    --sae_dir ../Outputs/mb/sae \
-    --experiment mb \
-    --sequences_csv ../Dataset/mBMRB.csv \
-    --feature_indices 234 426 --label_map mBMRB
-```
-
-`visualize_features` infers the embeddings file from the experiment directory:
-`Outputs/<exp>/embeddings/layer_<N>/shard_<S>/activations.pt` (`--layer` default 6,
-`--shard` default 0). Pass `--shard 1` to use a different shard, or override with
-`--embeddings_path <file>`. It re-applies the same shuffle+shard as extraction
-(`sample(frac=1, random_state=42)`) so the displayed proteins, their embeddings,
-and labels stay strictly aligned, and writes PNGs to
-`Outputs/<exp>/analysis/visualizations/`.
-
-`train_sae` likewise infers embeddings from the experiment directory
-(`Outputs/<exp>/embeddings/layer_<N>`, using ALL shards by default), overridable
-with `--embeddings_dir`; `--shard N` trains on a single shard. Tuning tips:
-- `--l1_penalty` controls sparsity (~0.06–0.1); higher → sparser features (lower
-  `l0`) but higher reconstruction loss.
-- `--resample_steps N` periodically revives "dead" features (never activated),
-  lowering `dead_pct`.
-- Target: **`l0` between 20–80, `dead_pct` < 30%, and `recon_loss` as low as possible**.
-
-Note: `--experiment <name>` routes all outputs into `Outputs/<name>/` — the name
-is used **verbatim (no timestamp)**, so every step of the same experiment shares
-one directory. Re-running a step with the same name reuses that directory (e.g.
-overwrites `ae.pt`). Use **distinct experiment names** for distinct runs. Pass
-`--exp_dir <existing_dir>` to point at an existing experiment directory directly.
-Any `--output_dir`/`--save_dir`/`--concepts_dir` explicitly given overrides the
-experiment routing.
-
-### Example Output
-
-```
-Top features for 'flexible' (label=1):
-  Feature #234: F1=0.514, AUROC=0.713, Prec=0.923, Rec=0.356
-  Feature #426: F1=0.517, AUROC=0.693, Prec=0.729, Rec=0.401
-
-High-precision "flexible residue detectors":
-  When feature #234 activates → 92% chance residue is truly flexible
-  But it only catches ~36% of all flexible residues
-```
-
-### Interpreting the Metrics
-
-| Metric | What it means |
-|--------|---------------|
-| **Precision** | When this feature activates, how often is the label correct? |
-| **Recall** | What fraction of positive cases does this feature catch? |
-| **F1** | Harmonic mean of precision and recall |
-| **AUROC** | Overall discriminative power (0.5=random, 1.0=perfect) |
-| **Activation Gap** | Mean(positive activation) − Mean(negative activation) |
-
-### Configurable Label Maps
-
-The pipeline is **not hardcoded to mBMRB**. Label encoding, the positive class, and
-class names are configurable via `--label_map` on every script. This lets you analyze
-datasets with different label formats without changing any code.
-
-**Built-in presets** (defined in `single/label_maps.py`):
+**Configurable label maps.** Label encoding is not hardcoded to mBMRB. Every script
+accepts `--label_map <preset>` (from `single/label_maps.py`) or a YAML file:
 
 | Preset | Positive class | Class names | Character mapping |
 |--------|---------------|-------------|-------------------|
@@ -211,69 +164,96 @@ datasets with different label formats without changing any code.
 | `relaxdb` | 1 | static / mobile | `p/A/v→0`, `./b/^→1` |
 | `ss3` | 1 | coil / strand / helix | `C→0`, `E→1`, `H→2` (3-class) |
 
-> The `ss3` ids follow the training module's `build_label_map` (`sorted(unique)`,
-> i.e. `C < E < H`), so a model trained with an inferred label map evaluates
-> consistently with this preset.
+> `ss3` ids match the training module's `build_label_map` (`sorted(unique)`, i.e.
+> `C < E < H`), so a model trained with an inferred map evaluates consistently.
 
-Use a preset by name:
-```bash
-python -m single.scripts.analyze_features \
-    --sae_dir ... --sequences_csv ... --label_column label --label_map relaxdb
-```
-
-Or provide your own YAML file for custom datasets:
+Custom YAML:
 ```yaml
 # my_dataset.yaml
 positive_class: 1
-class_names:
-  0: rigid
-  1: flexible
-mapping:
-  A: 0
-  ".": 1
-  "0": 0
-  "1": 1
+class_names: {0: rigid, 1: flexible}
+mapping: {A: 0, ".": 1, "0": 0, "1": 1}
 ignore: "_"
 ```
+Characters not in `mapping` become `-100` (ignored), following the HuggingFace
+ignore-index convention.
+
+### 2.1 Task-Label Alignment
+
+Align each SAE feature with the task labels (e.g. rigid/flexible) to find
+"flexibility detectors".
+
 ```bash
+cd Single
+
+# Extract hidden states from the fine-tuned model (creates Outputs/mb/)
+python -m single.scripts.extract_embeddings \
+    --ckpt_path ../Training/outputs/tasks/my_task/checkpoints/best \
+    --sequences_csv ../Dataset/mBMRB.csv \
+    --experiment mb \
+    --label_column label --label_map mBMRB
+
+# Train SAE (320-dim → 640 features; embeddings inferred, all shards by default)
+python -m single.scripts.train_sae \
+    --experiment mb \
+    --batch_size 64 --dict_size 640 --steps 20000 --l1_penalty 0.08 \
+    --resample_steps 2000
+
+# Align features with task labels
 python -m single.scripts.analyze_features \
-    --sae_dir ... --sequences_csv ... --label_column label --label_map my_dataset.yaml
+    --sae_dir ../Outputs/mb/sae \
+    --embeddings_dir ../Outputs/mb/embeddings/layer_6 \
+    --experiment mb \
+    --sequences_csv ../Dataset/mBMRB.csv --label_column label --label_map mBMRB
+
+# Visualize top features on sequences (embeddings_path inferred from experiment)
+python -m single.scripts.visualize_features \
+    --sae_dir ../Outputs/mb/sae \
+    --experiment mb \
+    --sequences_csv ../Dataset/mBMRB.csv \
+    --feature_indices 234 426 --label_map mBMRB
 ```
 
-Any character not in `mapping` becomes `-100` (ignored in analysis), following the
-HuggingFace ignore-index convention. Add new presets to `LABEL_MAPS` in
-`single/label_maps.py` to reuse them across runs.
+**Tuning tips for `train_sae`:**
+- `--l1_penalty` controls sparsity (~0.06–0.1); higher → sparser features (lower
+  `l0`) but higher reconstruction loss.
+- `--resample_steps N` periodically revives "dead" features, lowering `dead_pct`.
+- Target: **`l0` 20–80, `dead_pct` < 30%, `recon_loss` as low as possible**.
 
-### Biological Concept Analysis (Swiss-Prot / UniProtKB)
+**Metrics per feature:** Precision (when it activates, how often is the label
+correct?), Recall (fraction of positives caught), F1, AUROC (0.5=random,
+1.0=perfect), Activation Gap.
 
-Beyond task labels, you can align SAE features against **biological concepts** from
-Swiss-Prot — e.g. "Helix", "Domain_kinase", "Binding_site_ATP", "Active site" —
-to discover what real biology each feature encodes. This is a two-step pipeline
-(`single/scripts/analyze_concepts.py`).
+**Example output:**
+```
+Top features for 'flexible' (label=1):
+  Feature #234: F1=0.514, AUROC=0.713, Prec=0.923, Rec=0.356
+  Feature #426: F1=0.517, AUROC=0.693, Prec=0.729, Rec=0.401
+```
+
+### 2.2 Biological Concept Analysis (Swiss-Prot / UniProtKB)
+
+Align SAE features against **biological concepts** — e.g. "Helix",
+"Domain_kinase", "Binding_site_ATP" — to discover what real biology each feature
+encodes. Two-step pipeline (`single/scripts/analyze_concepts.py`).
 
 **Step 1: Build per-residue concept matrices from a UniProtKB TSV export.**
 
-The TSV must contain the `Entry` and `Sequence` columns plus Feature-table columns
-(`Helix`, `Beta strand`, `Turn`, `Domain [FT]`, `Active site`, `Binding site`, etc.).
-Download from UniProt with a query like: `reviewed:true` → Export → TSV.
+The TSV must contain `Entry`, `Sequence`, and Feature-table columns (`Helix`,
+`Beta strand`, `Turn`, `Domain [FT]`, `Active site`, `Binding site`, etc.).
+Download from UniProt with `reviewed:true` → Export → TSV.
 
 ```bash
 python -m single.scripts.analyze_concepts build \
     --annotations_tsv ../Dataset/uniprotkb_swissprot.tsv \
     --experiment sp \
     --n_shards 5 \
-    --max_residues 510   # must equal embedder max_length - 2 (default 512 -> 510)
+    --max_residues 510   # must equal embedder max_length - 2 (512 -> 510)
 ```
 
-This expands each protein-level annotation to amino-acid level and saves
-`shard_N/aa_concepts.npz` (sparse matrices) + `aa_concepts_columns.txt` (concept names)
-into `Outputs/sp/concepts/`.
-
-> **Alignment requirement:** pass `--max_residues` (embedder `max_length` − 2, e.g.
-> 510 for the default 512) so concept rows cover exactly the same residues the
-> embedder keeps. Sequences longer than this are truncated identically on both
-> sides; without it, concept matrices use the full-length sequence and can misalign
-> with truncated embeddings.
+> **Alignment requirement:** `--max_residues` (embedder `max_length` − 2) makes
+> concept rows cover exactly the residues the embedder keeps, avoiding misalignment
+> on long sequences.
 
 **Step 2: Align SAE features to concepts.**
 
@@ -285,40 +265,32 @@ python -m single.scripts.analyze_concepts align \
     --threshold_percents 0 0.15 0.5 0.6 0.8
 ```
 
-Concepts and output are routed into `Outputs/sp/` automatically. Note that the
-**embeddings must be extracted from the same TSV** (same `--n_shards`) so embedding
-and concept shards are token-aligned.
-
-For every feature × concept pair, computes F1 / precision / recall / AUROC / domain-F1
-across activation thresholds and saves:
-
-- `feature_concept_pairs.csv` — ALL pairs (filter with pandas, e.g. by AUROC)
-- `feature_concept_metrics.json` — full per-pair metrics
+For every feature × concept pair, computes F1 / precision / recall / AUROC /
+domain-F1 across thresholds, saving `feature_concept_pairs.csv` (all pairs) and
+`feature_concept_metrics.json`.
 
 **Example output:**
-
 ```
 Top feature-concept associations (by F1):
   Feature #42  → Domain_kinase                  F1=0.623 AUROC=0.781 P=0.710 R=0.551
   Feature #107 → Helix                          F1=0.588 AUROC=0.742 P=0.650 R=0.537
-  Feature #3   → Binding_site_ATP               F1=0.411 AUROC=0.694 P=0.502 R=0.348
 ```
 
-Note: to get exact per-protein alignment between embeddings and concept matrices,
-extract embeddings from the **same TSV** with `extract_embeddings.py` (per-shard order
-must match). If shard counts differ, the script falls back to best-effort splitting.
+**`f1` vs `f1_per_domain`:** `f1` counts residues (strict, skewed by domain length);
+`f1_per_domain` counts domain instances (a domain is "hit" if the feature activates
+anywhere within it). Prefer high `f1_per_domain` for robust concept recognition.
 
-### Held-out Validation
+### 2.3 Validation & Fidelity
 
-Reporting the "best feature per concept" with its F1 on the *same* data used for
-selection is optimistically biased — among 640 features, some will score high on a
-concept purely by chance (selection bias). Held-out validation separates selection
-from evaluation:
+Two checks that make the feature findings trustworthy.
 
-1. Split concept shards into a **valid** split and a **test** split (non-overlapping).
-2. On the **valid** split, pick the top feature per concept (the *selection* step).
-3. On the **test** split, evaluate **only the selected pairs** — these metrics are
-   unbiased estimates of real performance on unseen data.
+**Held-out validation** removes selection bias. Reporting the "best feature per
+concept" on the *same* data used for selection is optimistically biased — among 640
+features some score high purely by chance.
+
+1. Split concept shards into a **valid** and a **test** split.
+2. On **valid**, pick the top feature per concept (selection).
+3. On **test**, evaluate only the selected pairs (unbiased).
 
 ```bash
 python -m single.scripts.analyze_concepts heldout \
@@ -328,36 +300,12 @@ python -m single.scripts.analyze_concepts heldout \
     --split_mode half \
     --threshold_percents 0 0.15 0.5 0.6 0.8
 ```
+Outputs `heldout_top_pairings.csv` (selected pairs, test metrics) and
+`heldout_all_top_pairings.csv` (those above `--heldout_f1_threshold`).
 
-Output files in the experiment's `analysis/` (see the data-flow below):
-
-```
-heldout_valid_pairs.csv  (all pairs on valid split)
-heldout_test_pairs.csv   (all pairs on test split)
-        │                        │
-        │  select top feature    │  keep only selected pairs
-        │  per concept ─────────►│
-        ▼                        ▼
-                          heldout_top_pairings.csv   (selected pairs, test metrics)
-                                │  filter f1_per_domain ≥ threshold
-                                ▼
-                          heldout_all_top_pairings.csv  (robust findings)
-```
-
-- `heldout_valid_pairs.csv` / `heldout_test_pairs.csv` — the full feature×concept
-  tables for each split (raw "mother" tables).
-- `heldout_top_pairings.csv` — one selected pair per concept, **metrics computed on
-  the test split only**. A large drop vs. the valid-split value reveals selection bias.
-- `heldout_all_top_pairings.csv` — the selected pairs that stay strong on the test
-  split (`f1_per_domain ≥ --heldout_f1_threshold`). **This is the most trustworthy
-  set of feature-concept findings.**
-
-### Fidelity (Loss Recovered)
-
-Fidelity validates that the SAE is a *faithful* representation of the fine-tuned
-model's task-relevant activations — the foundation that makes feature analysis
-meaningful. The target layer's hidden states are replaced three ways and the model's
-**task loss** (token classification) is compared:
+**Fidelity (loss recovered)** validates that the SAE faithfully represents the
+model's task-relevant activations. The target layer's hidden states are replaced
+three ways and the model's **task loss** is compared:
 
 ```
 ce_orig : original activations
@@ -366,9 +314,7 @@ ce_zero : layer zeroed (worst case)
 
 Loss_Recovered = 1 - (ce_sae - ce_orig) / (ce_zero - ce_orig)
 ```
-
-- **100%** — the SAE perfectly preserves the information the model uses for its task.
-- **0%** — the SAE is as harmful as zeroing the layer (feature analysis would be moot).
+100% = perfectly preserves task info; 0% = as harmful as zeroing the layer.
 
 ```bash
 python -m single.scripts.evaluate_fidelity \
@@ -378,127 +324,41 @@ python -m single.scripts.evaluate_fidelity \
     --experiment sp \
     --layer 6 --label_column label --label_map mBMRB
 ```
-
-Saves `fidelity_results.json` in the experiment's `analysis/`, including a
-`reconstruction_mse` sanity check (per-element MSE between SAE reconstruction and
-the original hidden states over non-padding residues; low ≈ the reconstruction is
-genuinely close). **Note:** injection currently supports the final layer
-(`hidden_states[6]` = `emb_layer_norm_after` output); intermediate layers need
-extended hooking.
-
-### f1 vs f1_per_domain
-
-- **`f1`** counts **residues**: requires every residue position to be predicted
-  correctly — strict, and skewed by domain length.
-- **`f1_per_domain`** counts **domain instances**: a domain is "hit" if the feature
-  activates anywhere within it — measures whether the feature *recognizes the
-  concept*, not its positional precision.
-
-InterPLM uses `f1_per_domain` as the primary concept-association metric. In held-out
-reports, prefer pairs with **high `f1_per_domain`** (robust recognition) rather than
-raw `f1`.
+Saves `fidelity_results.json` incl. a `reconstruction_mse` sanity check.
+**Note:** injection currently supports the final layer only
+(`hidden_states[6]` = `emb_layer_norm_after` output).
 
 ---
 
-## Features
+## Module 3: Crossing — Planned
 
-### Training Module
-| Feature | Description |
-|---------|-------------|
-| **Two-phase workflow** | init (template) → train, keeping config separate from code |
-| **CSV input** | `sequence` + `label` columns, automatic train/eval split |
-| **Ignore positions** | `_` labels are excluded from loss |
-| **Auto class weights** | `inverse` / `log` / `none` strategies |
-| **Metrics** | Loss + Accuracy + Macro F1 + AUPRC |
-| **Top-3 checkpoints** | Keeps best 3 by F1, cleans old ones automatically |
-| **Training curve** | Auto-generated epoch–F1 plot after training |
-| **Eval plots** | Confusion matrix + Precision-Recall curve |
+Not yet implemented. Planned directions:
 
-### SAE Interpretability Module
-| Feature | Description |
-|---------|-------------|
-| **Fine-tuned PLM support** | Extracts hidden states from any fine-tuned `AutoModelForTokenClassification` |
-| **Configurable labels** | `--label_map` presets or YAML files for any dataset format |
-| **ReLU / TopK SAE** | Two standard SAE architectures |
-| **L1 sparsity + dead neuron resampling** | Standard training recipe from mechanistic interpretability |
-| **Feature-label alignment** | F1, AUROC, correlation, activation gap per feature |
-| **Feature-concept alignment** | F1/AUROC per feature vs Swiss-Prot biological concepts (multi-label) |
-| **UniProt annotation parsing** | TSV Feature-table annotations → per-residue sparse concept matrices |
-| **Domain-level F1** | `f1_per_domain` counts structural-domain instances hit, not just residues |
-| **Percentile thresholds** | InterPLM-style percent-of-max activation thresholds |
-| **Held-out validation** | Select on valid split, evaluate on held-out test split (unbiased) |
-| **Fidelity (loss recovered)** | Task loss preserved when SAE reconstructions replace layer activations |
-| **Per-protein tracking** | Find which proteins maximally activate each feature |
-| **Visualization** | Feature activation vs ground truth on sequences |
-| **Normalization** | Feature-wise max-activation normalization for meaningful comparisons |
+- **Single-model**: neuron / attention-head importance, causal intervention
+  (activation patching), representation probing.
+- **Cross-model**: comparative analysis across PLMs (ESM-2, ProtBERT, Ankh),
+  task-specific vs task-common representation separation, feature transferability.
 
----
+Concrete placeholders for future work (would live in `single/analysis/`):
 
-## Planned Features
+**Structure-vs-Sequence Scatter** — distinguishes whether a feature encodes a 3D
+structural property or a local sequence motif. Plot `x = sequential Cohen's d`,
+`y = structural Cohen's d`; features far above the diagonal encode spatially
+clustered biology (e.g. a catalytic pocket).
 
-> These functions are **not yet implemented** — placeholders for future work, in
-> priority order. They would go in `single/analysis/` alongside the existing tools.
-
-### Structure-vs-Sequence Scatter (planned)
-
-**Purpose:** distinguish whether a feature encodes a *3D structural* property or a
-*local sequence motif*. For each feature, compute two effect sizes:
-
-- `sequential Cohen's d` — how far (in sequence) the activated residues are from the
-  inactivated ones → whether the feature responds to a linear amino-acid pattern.
-- `structural Cohen's d` — whether the activated residues cluster in 3D space
-  (AlphaFold / PDB structures) → whether the feature encodes a spatial property.
-
-Plot `x = sequential`, `y = structural`. Features far above the diagonal encode
-spatially-clustered biology (e.g. a catalytic pocket), the most interesting
-interpretability finding; features near the diagonal are just sequence motifs.
-
-- **Dependencies:** per-protein AlphaFold/PDB structures (`Dataset/uniprot/`),
-  residue-level structural alignment.
-- **Suggested interface:** `single/scripts/analyze_structure_vs_sequence.py`.
-
-### Causal Intervention (planned)
-
-**Purpose:** move from *correlation* to *causation*. All current analysis shows that
-a feature *co-occurs* with a concept/label. Intervention directly perturbs a feature
-(e.g. zero or amplify Feature #375's activation) and observes whether the fine-tuned
-model's prediction actually changes.
-
-- If zeroing "acidic-region detector" Feature #375 flips the model's flexibility
-  prediction on acidic regions → the feature *causally drives* the model's decision.
-- Builds on Fidelity's activation-injection mechanism
-  (`single/train/fidelity.py`), extended from "whole-layer replacement" to
-  "per-feature perturbation" (feature steering / activation patching).
-
-- **Suggested interface:** `single/scripts/steer_features.py` or a
-  `single/analysis/intervention.py` module.
-
----
-
-## Status
-
-| Module | Status |
-|--------|--------|
-| **Training** | ✅ Tested and functional |
-| **Single (SAE Interpretability)** | ✅ Tested and functional |
-| **Crossing** | 🔄 In planning |
-
-### Crossing Module (Planned)
-
-- **Single-model interpretability**: neuron / attention head importance analysis, causal intervention (activation patching), representation probing
-- **Cross-model interpretability**: comparative analysis across different PLMs (ESM-2, ProtBERT, Ankh), task-specific vs task-common representation separation, cross-model feature transferability
+**Causal Intervention** — moves from correlation to causation: perturb a feature
+(e.g. zero or amplify Feature #375) and observe whether the model's prediction
+changes. Builds on Fidelity's activation-injection mechanism, extended to
+per-feature perturbation (feature steering).
 
 ---
 
 ## Dependencies
 
-A single root `requirements.txt` covers both the Training and SAE modules:
-
 ```bash
 pip install -r requirements.txt
 ```
-Or install the SAE package in development mode (pulls its dependencies from
-`setup.py`):
+Or install the SAE package in development mode (pulls deps from `setup.py`):
 ```bash
 cd Single && pip install -e .
 ```
@@ -507,42 +367,36 @@ cd Single && pip install -e .
 
 ## Output Structure
 
-Every step of the pipeline writes into one **experiment directory** (named by
-`--experiment <name>`, verbatim with no timestamp; reuse with `--exp_dir`):
+Every step writes into one **experiment directory** (named by `--experiment`,
+verbatim, no timestamp; reuse with `--exp_dir`):
 
 ```
 Outputs/
 └── <experiment>/
-    ├── embeddings/
-    │   └── layer_<N>/                # Per-residue hidden states
-    │       ├── shard_0/activations.pt
-    │       ├── shard_1/activations.pt
-    │       └── ...
+    ├── embeddings/layer_<N>/shard_<i>/activations.pt   # Hidden states
     ├── sae/
-    │   ├── ae.pt                      # SAE weights
+    │   ├── ae.pt                                       # SAE weights
     │   └── checkpoint_<step>/
     ├── concepts/
-    │   ├── shard_<i>/aa_concepts.npz # Per-residue concept matrices
+    │   ├── shard_<i>/aa_concepts.npz                   # Per-residue concepts
     │   └── aa_concepts_columns.txt
     └── analysis/
-        ├── feature_concept_pairs.csv  # Feature × concept alignment (all pairs)
-        ├── feature_concept_metrics.json
-        ├── feature_label_metrics.json # Task-label alignment
-        ├── feature_label_correlations.npy
-        ├── activation_profile.npz
-        └── visualizations/            # PNG plots
+        ├── feature_concept_pairs.csv                   # Concept alignment
+        ├── feature_label_metrics.json                  # Task-label alignment
+        ├── heldout_*.csv                               # Held-out validation
+        ├── fidelity_results.json                       # Fidelity
+        └── visualizations/                             # PNG plots
 ```
 
-`single/paths.py` centralizes these paths; scripts resolve subdirectories from the
-experiment dir automatically. Explicit `--output_dir` / `--save_dir` /
-`--concepts_dir` flags override the routing when you need custom locations.
+`single/paths.py` centralizes these paths. Explicit `--output_dir` / `--save_dir`
+/ `--concepts_dir` flags override the routing.
 
 ---
 
 ## Citation
 
-A manuscript is in preparation. In the meantime, if you use this code in your
-research, please cite the repository:
+A manuscript is in preparation. In the meantime, if you use this code, please cite
+the repository:
 
 ```bibtex
 @misc{crossplm,
@@ -554,13 +408,7 @@ research, please cite the repository:
 }
 ```
 
-Or cite it as:
-
-> CrossPLM: Cross-Task Mechanistic Interpretability for Protein Language Models.
-> GitHub repository, https://github.com/lbwfff/CrossPLM.
-
-Please also consider citing the method this project builds upon (the SAE-based
-feature-extraction and concept-alignment approach):
+Please also consider citing the method this project builds upon:
 
 ```bibtex
 @article{simon2025interplm,
