@@ -47,6 +47,7 @@ def extract_embeddings(
     label_map: str = "mBMRB",
     min_seq_len: int = 0,
     max_seq_len: int = 10_000,
+    max_sequences: Optional[int] = None,
 ):
     from single.paths import resolve_experiment
 
@@ -58,8 +59,13 @@ def extract_embeddings(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    from single.label_maps import get_label_map
+    from single.label_maps import get_label_map, resolve_columns
     label_map_spec = get_label_map(label_map)
+    # The label map describes the dataset's columns; use them unless the user
+    # explicitly overrode them on the command line.
+    sequence_column, label_column = resolve_columns(
+        label_map_spec, sequence_column, label_column
+    )
 
     embedder = FineTunedESMEmbedder(
         ckpt_path=ckpt_path,
@@ -74,7 +80,8 @@ def extract_embeddings(
     # proteins), and fixed-seed shuffle+shard — all in single.data.
     from single.data import load_sequences_df, shuffled_shards
     df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
-                           min_seq_len=min_seq_len, max_seq_len=max_seq_len)
+                           min_seq_len=min_seq_len, max_seq_len=max_seq_len,
+                           max_sequences=max_sequences)
     sequences = df[sequence_column].tolist()
     print(f"Loaded {len(sequences)} sequences")
 
@@ -144,6 +151,8 @@ def main(argv=None):
                         help="Label encoding preset name or path to YAML label-map file")
     parser.add_argument("--min_seq_len", type=int, default=0,
                         help="Drop sequences shorter than this (must match concept build)")
+    parser.add_argument("--max_sequences", type=int, default=None,
+                        help="Deterministic subset; must match extract_embeddings --max_sequences")
     parser.add_argument("--max_seq_len", type=int, default=10000,
                         help="Drop sequences longer than this (must match concept build)")
     args = parser.parse_args(argv)

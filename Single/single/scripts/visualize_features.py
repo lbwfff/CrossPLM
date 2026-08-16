@@ -155,6 +155,7 @@ def visualize_features(
     max_length: int = 512,
     min_seq_len: int = 0,
     max_seq_len: int = 10_000,
+    max_sequences: Optional[int] = None,
 ):
     from single.paths import resolve_experiment
 
@@ -186,8 +187,14 @@ def visualize_features(
         print(f"Inferred embeddings path: {embeddings_path}")
     embeddings_path = Path(embeddings_path)
 
-    from single.label_maps import get_label_map
+    from single.label_maps import get_label_map, resolve_columns
     label_map_spec = get_label_map(label_map)
+    # The label map describes the dataset's columns; use them unless the user
+    # explicitly overrode them on the command line.
+    sequence_column, label_column = resolve_columns(
+        label_map_spec, sequence_column, label_column
+    )
+
     label_names = label_map_spec["class_names"]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -213,7 +220,8 @@ def visualize_features(
         from single.data import load_sequences_df, shuffled_shards
 
         df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
-                               min_seq_len=min_seq_len, max_seq_len=max_seq_len)
+                               min_seq_len=min_seq_len, max_seq_len=max_seq_len,
+                               max_sequences=max_sequences)
 
         # Determine shard count from the embeddings directory (for the given layer).
         n_shards = len(list(exp.embeddings_dir(layer=layer).glob("shard_*"))) if exp else 1
@@ -297,6 +305,8 @@ def main(argv=None):
                              "to max_length-2)")
     parser.add_argument("--min_seq_len", type=int, default=0,
                         help="Must match extract_embeddings --min_seq_len")
+    parser.add_argument("--max_sequences", type=int, default=None,
+                        help="Deterministic subset; must match extract_embeddings --max_sequences")
     parser.add_argument("--max_seq_len", type=int, default=10000,
                         help="Must match extract_embeddings --max_seq_len")
     parser.add_argument("--sequences_csv", type=Path, default=None)

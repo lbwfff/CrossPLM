@@ -1,5 +1,6 @@
 import shutil
 from pathlib import Path
+from typing import Optional
 
 import torch as t
 from tqdm import tqdm
@@ -45,6 +46,39 @@ class SAETrainingRun:
             "l0": l0,
             "dead_pct": dead_pct,
             "rarely_active_pct": rarely_pct,
+        }
+
+    def dataset_dead_fraction(self, n_batches: Optional[int] = None):
+        """Dead/rarely-active fractions over the WHOLE dataset (or `n_batches`).
+
+        The per-batch `compute_metrics` dead_pct is pessimistic: a feature that
+        fires on ~1% of tokens looks "dead" in a single 64-token batch. Scanning
+        many batches gives the true activation statistics. "Dead" here means a
+        feature never activated on any scanned token; "rarely active" means it
+        activated on <1% of scanned tokens.
+        """
+        self.trainer.ae.eval()
+        n_features = self.trainer.ae.dict_size
+        active_counts = t.zeros(n_features, dtype=t.int64, device=self.trainer.device)
+        total_tokens = 0
+        n_seen = 0
+        with t.no_grad():
+            for batch in self.data:
+                f = self.trainer.ae.encode(batch.to(self.trainer.device))
+                active_counts += (f > 0).sum(dim=0)
+                total_tokens += batch.shape[0]
+                n_seen += 1
+                if n_batches is not None and n_seen >= n_batches:
+                    break
+        rate = active_counts.float() / max(total_tokens, 1)
+        dead_pct = (rate == 0).float().mean().item() * 100
+        rarely_pct = (rate < 0.01).float().mean().item() * 100
+        self.trainer.ae.train()
+        return {
+            "n_tokens": total_tokens,
+            "n_batches": n_seen,
+            "dead_pct": round(dead_pct, 2),
+            "rarely_active_pct": round(rarely_pct, 2),
         }
 
     def run(self):
@@ -101,10 +135,15 @@ class SAETrainingRun:
 
         t.save(trainer.ae.state_dict(), save_dir / "model.pt")
         print(f"\n{'='*50}")
-        print("Training complete. Final metrics on last batch:")
+        print("Training complete. Final metrics on last batch (per-batch view):")
         final = self.compute_metrics(batch)
         for k, v in final.items():
             print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+        # Dataset-wide dead-fraction (the batch-level dead_pct is pessimistic).
+        print("Dataset-wide feature statistics (more reliable than the batch view):")
+        ds_stats = self.dataset_dead_fraction(n_batches=None)
+        for k, v in ds_stats.items():
+            print(f"  {k}: {v}")
         print(f"{'='*50}")
 
     def _prune_checkpoints(self, save_dir: Path):

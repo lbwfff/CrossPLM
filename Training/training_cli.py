@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 
 
-def _load_label_map(name):
+def _load_label_map(name, base_dir=None):
     """Load a label-map spec (preset name or YAML file path).
 
     Uses the SAME label maps as the interpretability module
@@ -20,14 +20,17 @@ def _load_label_map(name):
     The spec carries the sequence/label column names, the char->class mapping,
     and ignore characters.
 
-    Relative YAML paths are resolved against the Training module directory (like
-    csv_data_path), so the result does not depend on the current working dir.
+    Relative YAML paths resolve against `base_dir` when given (the Training
+    module dir for `config.label_map`, like csv_data_path); otherwise they stay
+    relative to the current working dir (for CLI flags like --label_map, which
+    mirror --csv).
     """
     from single.label_maps import get_label_map
 
     p = Path(name)
     if p.suffix in {".yaml", ".yml"} and not p.is_absolute():
-        p = Path(os.path.dirname(os.path.abspath(__file__))) / p
+        if base_dir is not None:
+            p = Path(base_dir) / p
     return get_label_map(str(p))
 
 
@@ -42,10 +45,12 @@ def cmd_labelmap(args):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         out = Path(script_dir).parent / "Dataset" / f"{args.name}.yaml"
     path = generate_template(out)
-    rel = os.path.relpath(path, os.path.dirname(os.path.abspath(__file__)))
+    rel_to_training = os.path.relpath(path, os.path.dirname(os.path.abspath(__file__)))
+    rel_to_cwd = os.path.relpath(path, os.getcwd())
     print(f"[Label Map Template] {path}")
-    print(f"Edit it, then reference it via config 'label_map: {rel}' or "
-          f"'--label_map {rel}' (relative to Training/).")
+    print(f"Edit it, then reference it via config 'label_map: {rel_to_training}' "
+          f"(relative to Training/), or on the CLI '--label_map {rel_to_cwd}' "
+          "(relative to your current directory).")
 
 
 def cmd_init(args):
@@ -107,7 +112,9 @@ def cmd_train(args):
     spec = None
     label_map = None
     if config.label_map:
-        spec = _load_label_map(config.label_map)
+        # config paths resolve against the Training module dir (like csv_data_path)
+        spec = _load_label_map(config.label_map,
+                               base_dir=os.path.dirname(os.path.abspath(__file__)))
         label_map = dict(spec["mapping"])
         seq_col = spec.get("sequence_column") or config.sequence_column
         lbl_col = spec.get("label_column") or config.label_column
@@ -296,15 +303,19 @@ def cmd_eval(args):
     cm = confusion_matrix(all_labels, all_preds, labels=list(range(n_classes)))
 
     # AUPRC: macro-avg of per-class PR-AUC (handles binary and >2 classes).
-    # We also keep the last per-class (precision, recall) curves for plotting.
+    # Per-class values are also reported — for a rare-positive (binary) task the
+    # POSITIVE-class AUPRC is the meaningful number, not the macro average.
     from sklearn.metrics import precision_recall_curve, auc
     auprc = 0.0
+    auprc_per_class = {}
     per_class_pr = []  # list of (precision, recall) arrays for plotting
     try:
         for cls in range(n_classes):
             y_bin = [1 if l == cls else 0 for l in all_labels]
             p, r, _ = precision_recall_curve(y_bin, [prob[cls] for prob in all_probs])
-            auprc += auc(r, p)
+            auc_cls = auc(r, p)
+            auprc += auc_cls
+            auprc_per_class[str(cls)] = round(auc_cls, 4)
             per_class_pr.append((p, r))
         auprc /= n_classes
     except Exception as e:
@@ -314,6 +325,7 @@ def cmd_eval(args):
     print(f"\n  Accuracy:  {accuracy:.4f}")
     print(f"  F1 (macro): {f1:.4f}")
     print(f"  AUPRC (macro): {auprc:.4f}")
+    print(f"  AUPRC per class: {auprc_per_class}")
     print(f"  Num classes: {n_classes}")
     print("\n  Confusion Matrix (rows=actual, cols=pred):")
     print("        " + " ".join(f"Pred{i:>5}" for i in range(n_classes)))
@@ -321,7 +333,8 @@ def cmd_eval(args):
         print(f"  Act{i:>3}  " + " ".join(f"{cm[i][j]:>9d}" for j in range(n_classes)))
 
     metrics = {"accuracy": round(accuracy, 4), "f1_macro": round(f1, 4),
-               "auprc_macro": round(auprc, 4), "n_classes": n_classes,
+               "auprc_macro": round(auprc, 4),
+               "auprc_per_class": auprc_per_class, "n_classes": n_classes,
                "confusion_matrix": cm.tolist(), "n_positions": len(all_labels),
                "checkpoint": args.checkpoint, "csv": args.csv}
 

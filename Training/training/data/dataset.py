@@ -119,14 +119,19 @@ def compute_class_weights(
                 continue
             counts[label_map[ch]] += 1
 
+    import math
     total = sum(counts)
 
     if method == "none":
         weights = [1.0] * n_classes
     elif method == "inverse":
         weights = [total / (n_classes * c) if c > 0 else 1.0 for c in counts]
+    elif method == "sqrt":
+        # Gentler than inverse: sqrt(inverse-ratio). For a rare positive class
+        # this down-weights it less aggressively, reducing the over-prediction
+        # bias (high recall / low precision) that full inverse weighting causes.
+        weights = [math.sqrt(total / (n_classes * c)) if c > 0 else 1.0 for c in counts]
     elif method == "log":
-        import math
         weights = [math.log(total / c) / math.log(2) if c > 0 else 1.0 for c in counts]
     else:
         raise ValueError(f"Unknown class_weight_method: {method}")

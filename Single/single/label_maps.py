@@ -178,6 +178,20 @@ def n_classes(spec: Dict) -> int:
     return max(spec["mapping"].values()) + 1 if spec["mapping"] else 0
 
 
+def resolve_columns(spec: Dict, sequence_column: str = "sequence",
+                    label_column: Optional[str] = None):
+    """
+    Effective CSV column names for a dataset: explicit arguments win, otherwise
+    the label-map spec's `sequence_column` / `label_column` (which describe the
+    dataset) are used.
+    """
+    if sequence_column == "sequence":
+        sequence_column = spec.get("sequence_column") or sequence_column
+    if label_column is None:
+        label_column = spec.get("label_column")
+    return sequence_column, label_column
+
+
 def load_labeled_sequences(csv_path, spec: Dict):
     """
     Load sequences + per-residue label strings from a CSV/TSV using the spec's

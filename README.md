@@ -137,10 +137,10 @@ python crossplm.py training train --config Outputs/my_experiment/config.yaml
 
 The config's `label_map:` field takes a preset name or YAML path (default
 template uses `mBMRB` and points `csv_data_path` at the raw
-`../Dataset/mBMRB.csv`). Relative `csv_data_path` / `label_map` YAML paths
-resolve against the `Training/` module directory, so they work regardless of
-where you run the command from. Leave `label_map` empty to infer the mapping
-from the CSV (legacy).
+`../Dataset/mBMRB.csv`). Relative `csv_data_path` / `label_map` YAML paths in
+the **config** resolve against the `Training/` module directory; on the eval
+**CLI**, `--label_map` (like `--csv`) resolves against your current directory.
+Leave `label_map` empty to infer the mapping from the CSV (legacy).
 
 ### 3. Evaluate a Checkpoint
 ```bash
@@ -254,11 +254,13 @@ when present**, putting every feature on a comparable 0–1 scale (so a
 Re-running `train_sae` removes any stale `model_normalized.pt` so it is regenerated
 for the new model.
 
-**Length-filter consistency.** Scripts that rebuild the protein/residue mapping
-from the sequences CSV (`analyze_sequence`, `analyze_coactivation`,
-`visualize_features`) accept `--min_seq_len` / `--max_seq_len`. If you used those
-flags during `extract_embeddings`, pass the **same values** here too — otherwise
-the residue mapping silently misaligns.
+**Filter/subset consistency.** Scripts that read the sequences CSV
+(`extract_embeddings`, `analyze_features`, `analyze_sequence`,
+`analyze_coactivation`, `visualize_features`) accept `--min_seq_len` /
+`--max_seq_len` / `--max_sequences`. If you used any of these flags during
+`extract_embeddings`, pass the **same values** here too — otherwise the
+protein/residue mapping silently misaligns. `--max_sequences N` draws a
+deterministic subset (fixed seed) so it's reproducible.
 
 **Configurable label maps.** Label encoding is not hardcoded to mBMRB. Every script
 accepts `--label_map <preset>` (from `single/label_maps.py`) or a YAML file:
@@ -517,6 +519,7 @@ python crossplm.py single analyze_sequence \
     --embeddings_dir Outputs/demo/mbmrb/embeddings/layer_6 \
     --sequences_csv Dataset/mBMRB.csv \
     --experiment demo --source mbmrb \
+    --label_map mBMRB \
     --feature_indices 375 42 \
     --shard 0
 ```
@@ -541,6 +544,7 @@ python crossplm.py single analyze_coactivation \
     --embeddings_dir Outputs/demo/mbmrb/embeddings/layer_6 \
     --sequences_csv Dataset/mBMRB.csv \
     --experiment demo --source mbmrb \
+    --label_map mBMRB \
     --feature_a 375 --feature_b 42 \
     --shard 0
 ```

@@ -46,6 +46,7 @@ def analyze(
     source: Optional[str] = None,
     output_dir: Optional[Path] = None,
     sequence_column: str = "sequence",
+    label_map: Optional[str] = None,
     layer: int = 6,
     shard: int = 0,
     n_shards: int = 5,
@@ -54,9 +55,17 @@ def analyze(
     activation_threshold: float = 0.0,
     min_seq_len: int = 0,
     max_seq_len: int = 10_000,
+    max_sequences: Optional[int] = None,
     sae_dir: Optional[Path] = None,
 ):
     from single.paths import resolve_experiment
+
+    # If a label map is given, use its sequence_column unless explicitly set.
+    if label_map:
+        from single.label_maps import get_label_map, resolve_columns
+        sequence_column, _ = resolve_columns(
+            get_label_map(label_map), sequence_column, None
+        )
 
     # --sae_dir and --output_dir default into Outputs/<experiment>/.
     exp = None
@@ -102,6 +111,7 @@ def analyze(
         sequences_csv, [shard], n_shards=n_shards, max_residues=max_residues,
         sequence_column=sequence_column,
         min_seq_len=min_seq_len, max_seq_len=max_seq_len,
+        max_sequences=max_sequences,
     )
     protein_ids = np.array(shard_proteins[shard], dtype=np.int64)
     respos = shard_respos[shard]
@@ -154,6 +164,8 @@ def main(argv=None):
     parser.add_argument("--sequences_csv", type=Path, required=True)
     parser.add_argument("--sequence_column", type=str, default="sequence",
                         help="Column holding the protein sequence")
+    parser.add_argument("--label_map", type=str, default=None,
+                        help="Label-map preset/YAML (uses its sequence_column)")
     parser.add_argument("--feature_a", type=int, required=True)
     parser.add_argument("--feature_b", type=int, required=True)
     parser.add_argument("--source", type=str, default=None,
@@ -170,6 +182,8 @@ def main(argv=None):
     parser.add_argument("--activation_threshold", type=float, default=0.0)
     parser.add_argument("--min_seq_len", type=int, default=0,
                         help="Must match extract_embeddings --min_seq_len")
+    parser.add_argument("--max_sequences", type=int, default=None,
+                        help="Deterministic subset; must match extract_embeddings --max_sequences")
     parser.add_argument("--max_seq_len", type=int, default=10000,
                         help="Must match extract_embeddings --max_seq_len")
     args = parser.parse_args(argv)

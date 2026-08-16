@@ -54,6 +54,7 @@ def analyze_features(
     max_length: int = 512,
     min_seq_len: int = 0,
     max_seq_len: int = 10_000,
+    max_sequences: Optional[int] = None,
     sae_dir: Optional[Path] = None,
 ):
     from single.paths import resolve_experiment
@@ -72,8 +73,14 @@ def analyze_features(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    from single.label_maps import get_label_map, class_name
+    from single.label_maps import get_label_map, class_name, resolve_columns
     label_map_spec = get_label_map(label_map)
+    # The label map describes the dataset's columns; use them unless the user
+    # explicitly overrode them on the command line.
+    sequence_column, label_column = resolve_columns(
+        label_map_spec, sequence_column, label_column
+    )
+
     positive_class = label_map_spec["positive_class"]
     pos_name = class_name(positive_class, label_map_spec)
     neg_name = class_name(0, label_map_spec) if 0 in label_map_spec["class_names"] else "negative"
@@ -130,7 +137,8 @@ def analyze_features(
         print("\n3. Parsing labels from CSV (replicating extract_embeddings shuffle+shard)...")
         from single.data import load_sequences_df, shuffled_shards
         df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
-                               min_seq_len=min_seq_len, max_seq_len=max_seq_len)
+                               min_seq_len=min_seq_len, max_seq_len=max_seq_len,
+                               max_sequences=max_sequences)
         df[label_column] = df[label_column].fillna("").astype(str)
         if sequence_column not in df.columns:
             raise ValueError(
@@ -296,6 +304,8 @@ def main(argv=None):
                              "truncated to max_length-2 to match truncated sequences")
     parser.add_argument("--min_seq_len", type=int, default=0,
                         help="Must match extract_embeddings --min_seq_len")
+    parser.add_argument("--max_sequences", type=int, default=None,
+                        help="Deterministic subset; must match extract_embeddings --max_sequences")
     parser.add_argument("--max_seq_len", type=int, default=10000,
                         help="Must match extract_embeddings --max_seq_len")
     args = parser.parse_args(argv)

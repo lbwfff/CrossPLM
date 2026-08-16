@@ -10,7 +10,7 @@ protein/residue mappings.
 
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -28,8 +28,16 @@ def load_sequences_df(
     sequence_column: str = "sequence",
     min_seq_len: int = 0,
     max_seq_len: int = 10_000,
+    max_sequences: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Load a sequences CSV/TSV with separator auto-detection and optional length filter."""
+    """Load a sequences CSV/TSV with separator auto-detection, optional length
+    filter, and an optional deterministic subset.
+
+    `max_sequences` takes a fixed-seed random sample AFTER the length filter, so
+    every pipeline step that calls this (extract + analysis) draws the SAME
+    sequences — pass the same value everywhere to keep embeddings/protein
+    mappings aligned.
+    """
     sep = detect_separator(path)
     df = pd.read_csv(path, sep=sep, low_memory=False)
     if sequence_column not in df.columns:
@@ -39,6 +47,8 @@ def load_sequences_df(
         df = df[df[sequence_column].apply(
             lambda s: min_seq_len <= len(s) <= max_seq_len
         )]
+    if max_sequences is not None and len(df) > max_sequences:
+        df = df.sample(n=max_sequences, random_state=42).reset_index(drop=True)
     return df
 
 
@@ -68,6 +78,7 @@ def build_residue_positions(
     sequence_column: str = "sequence",
     min_seq_len: int = 0,
     max_seq_len: int = 10_000,
+    max_sequences: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, Dict[int, List[int]], Dict[int, np.ndarray]]:
     """
     Rebuild the per-shard token -> (protein, residue) mapping.
@@ -75,8 +86,8 @@ def build_residue_positions(
     Replicates the exact shuffle+shard used by extract_embeddings, so each token
     maps back to (protein index, residue position within protein).
 
-    IMPORTANT: min_seq_len/max_seq_len MUST match whatever filter was used at
-    extraction, or the protein/residue mapping silently misaligns.
+    IMPORTANT: min_seq_len/max_seq_len/max_sequences MUST match whatever filter
+    was used at extraction, or the protein/residue mapping silently misaligns.
 
     Returns:
         df: the shuffled full DataFrame
@@ -84,7 +95,8 @@ def build_residue_positions(
         shard_respos:   {shard_id: np.ndarray of residue positions per token}
     """
     df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
-                           min_seq_len=min_seq_len, max_seq_len=max_seq_len)
+                           min_seq_len=min_seq_len, max_seq_len=max_seq_len,
+                           max_sequences=max_sequences)
     shards = shuffled_shards(df, n_shards)
 
     shard_proteins: Dict[int, List[int]] = {}

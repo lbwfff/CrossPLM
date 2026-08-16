@@ -32,7 +32,7 @@ import pandas as pd
 import torch
 
 from single.sae.inference import load_sae
-from single.label_maps import get_label_map
+from single.label_maps import get_label_map, resolve_columns
 from single.train.fidelity import evaluate_fidelity
 
 
@@ -70,6 +70,12 @@ def evaluate(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     label_map_spec = get_label_map(label_map)
+    # The label map describes the dataset's columns; use them unless the user
+    # explicitly overrode them on the command line.
+    sequence_column, label_column = resolve_columns(
+        label_map_spec, sequence_column, label_column
+    )
+
 
     print("=" * 60)
     print("SAE FIDELITY EVALUATION")

@@ -140,7 +140,9 @@ save_total_limit: 3
 
 # ----- Class weights (address imbalance) -----
 #   none     = no weighting
-#   inverse  = inverse frequency normalization (recommended)
+#   inverse  = inverse frequency normalization (aggressive, can over-predict the
+#              rare class -> high recall / low precision)
+#   sqrt     = sqrt of inverse ratio (gentler; try this if precision is low)
 #   log      = log scaling (gentler)
 class_weight_method: inverse
 
