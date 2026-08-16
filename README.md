@@ -9,14 +9,13 @@ Protein language models (PLMs) perform well on diverse biological tasks, but the
 ## Overview
 
 ```
-Dataset/  Preprocessing/   Training/        Single/        Outputs/
- (raw)        →         fine-tune a PLM → SAE analysis → per-experiment results
+Dataset/       Training/        Single/        Outputs/
+ (raw)  →  fine-tune a PLM → SAE analysis → per-experiment results
 ```
 
 | Directory | Role |
 |-----------|------|
 | `Dataset/` | Raw datasets (`mBMRB.csv`, `relaxdb_data.csv`), downloaded annotations (`uniprotkb_swissprot.tsv`), and label-map YAMLs (from `crossplm.py training labelmap`) |
-| `Preprocessing/` | Dataset-specific label preprocessing scripts |
 | `Training/` | PLM fine-tuning framework (init / train / eval CLI) |
 | `Single/` | SAE-based interpretability: extract → train SAE → analyze |
 | `Outputs/` | All per-experiment outputs (embeddings, SAE, concepts, analysis) |
@@ -60,9 +59,6 @@ CrossPLM/
 ├── Dataset/                     # Raw datasets
 │   ├── relaxdb_data.csv
 │   └── mBMRB.csv
-├── Preprocessing/               # Dataset preprocessing scripts
-│   ├── preprocess_relaxdb.py
-│   └── preprocess_mbmrb.py
 ├── Training/                    # PLM training framework
 │   ├── training_cli.py          # `crossplm training` implementation
 │   ├── training/                # Python package
@@ -107,8 +103,8 @@ ignore: "_"                 # chars excluded from training/eval (-100)
 ```
 
 Characters not in `mapping` are ignored too (encoded as `-100`, excluded from
-train/eval). Preprocessing scripts (`Preprocessing/`) are **optional** — they
-only exist to produce relabeled `0/1` CSVs; with a label map you can skip them.
+train/eval). No separate preprocessing is needed — both modules read the raw
+dataset CSV and apply the label map on the fly.
 
 **Generate an empty template** into `Dataset/` (shared by both modules):
 ```bash
@@ -285,8 +281,8 @@ Characters not in `mapping` become `-100` (ignored), following the HuggingFace
 ignore-index convention.
 
 > The `relaxdb` preset accepts **both** the raw `relaxdb_data.csv` characters
-> (`p/A/v→0`, `./b/^→1`, `t/x` ignored) and the preprocessed `0/1` form, so one
-> preset works whether or not you use `Preprocessing/preprocess_relaxdb.py`.
+> (`p/A/v→0`, `./b/^→1`, `t/x` ignored) and a `0/1`-relabeled CSV, so one preset
+> covers either file.
 
 ### 2.1 Task-Label Alignment
 

@@ -23,10 +23,6 @@ env/
 # Training artifacts (model weights are ignored via *.safetensors/*.bin)
 Training/outputs/
 
-# Preprocessed data (can be regenerated from Dataset/ raw files)
-Training/examples/relaxdb_processed.csv
-Training/examples/mbmrb_processed.csv
-
 # Model weights (all formats)
 *.safetensors
 *.bin
