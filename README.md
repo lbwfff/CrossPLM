@@ -85,7 +85,12 @@ CrossPLM/
 Fine-tunes a HuggingFace protein language model (e.g. ESM-2) on a per-residue
 token-classification task (e.g. backbone dynamics: rigid vs flexible).
 
-### 0. Data & Label Map (optional preprocessing)
+### 0. Data & Label Map
+
+> **Dataset/ is user-supplied and gitignored** — it is not synced to the repo.
+> Place your raw data (`mBMRB.csv`, `relaxdb_data.csv`,
+> `uniprotkb_swissprot.tsv`, ...) there yourself, and generate label-map
+> templates with `python crossplm.py training labelmap --name my_dataset`.
 
 The Training and Single modules share the **same label-map presets**
 (`mBMRB`, `relaxdb`, `ss3`) and YAML label-map files. A label map defines the
