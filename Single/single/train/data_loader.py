@@ -14,48 +14,68 @@ class ActivationDataset(Dataset):
     Supports:
     - Single tensor file (.pt)
     - Sharded directory structure (shard_N/embeddings.pt)
-    - Memory-mapped .dat files
+
+    Shards are memory-mapped (`torch.load(..., mmap=True)`) and kept as separate
+    tensors instead of being concatenated into one big in-RAM tensor, so large
+    datasets do not blow up memory. Rows are resolved lazily across shards on
+    access (only the current batch is materialized).
     """
 
     def __init__(
         self,
         data_path: Path,
         shard: Optional[int] = None,
+        mmap: bool = True,
     ):
-        # NOTE: this dataset is just an in-memory store of activation tokens; it does
-        # not seed any RNG. Shuffling is handled by the DataLoader via a dedicated
-        # torch.Generator so the global RNG is not polluted.
+        # NOTE: this dataset does not seed any RNG. Shuffling is handled by the
+        # DataLoader via a dedicated torch.Generator so the global RNG is not
+        # polluted.
         self.data_path = Path(data_path)
         self.shard = shard  # None = use all shards; else only that shard
+        self.mmap = mmap
+
+        self._shards = []       # list of (mmap'd) tensors, one per shard
+        self._offsets = []      # cumulative token count before each shard
+        self.total_tokens = 0
+        self.d_model = None
 
         if self.data_path.is_file():
-            self._load_single_file()
+            self._load_one(self.data_path)
         elif self.data_path.is_dir():
             self._load_sharded()
         else:
             raise FileNotFoundError(f"Data path not found: {data_path}")
 
-    def _load_single_file(self):
-        data = torch.load(self.data_path, map_location="cpu", weights_only=True)
+        if not self._shards:
+            raise FileNotFoundError(
+                f"No activation data found in {self.data_path}"
+                + (f" for shard {self.shard}" if self.shard is not None else "")
+            )
+        self.d_model = self._shards[0].shape[1]
+
+    def _load_one(self, path):
+        data = torch.load(path, map_location="cpu", weights_only=True,
+                          mmap=self.mmap)
         if isinstance(data, dict):
             data = data["embeddings"]
-        self.data = data.float()
-        self.d_model = self.data.shape[1]
-        self.total_tokens = self.data.shape[0]
+        # Convert only if needed (avoids copying an already-float32 mmap).
+        if data.dtype != torch.float32:
+            data = data.float()
+        self._shards.append(data)
+        self._offsets.append(self.total_tokens)
+        self.total_tokens += data.shape[0]
+
+    def _load_single_file(self):
+        self._load_one(self.data_path)
 
     def _load_sharded(self):
-        shards = []
         subdirs = sorted([d for d in self.data_path.iterdir() if d.is_dir()])
         if not subdirs:
             pt_files = sorted(self.data_path.glob("*.pt"))
-            if pt_files:
-                for f in pt_files:
-                    data = torch.load(f, map_location="cpu", weights_only=True)
-                    if isinstance(data, dict):
-                        data = data["embeddings"]
-                    shards.append(data.float())
-            else:
+            if not pt_files:
                 raise FileNotFoundError(f"No shard data found in {self.data_path}")
+            for f in pt_files:
+                self._load_one(f)
         else:
             for subdir in subdirs:
                 # If a specific shard was requested, skip all others.
@@ -65,26 +85,19 @@ class ActivationDataset(Dataset):
                         continue
                 pt_file = subdir / "embeddings.pt"
                 if pt_file.exists():
-                    data = torch.load(pt_file, map_location="cpu", weights_only=True)
-                    if isinstance(data, dict):
-                        data = data["embeddings"]
-                    shards.append(data.float())
-
-        if not shards:
-            raise FileNotFoundError(
-                f"No activation data found in {self.data_path}"
-                + (f" for shard {self.shard}" if self.shard is not None else "")
-            )
-
-        self.data = torch.cat(shards, dim=0)
-        self.d_model = self.data.shape[1]
-        self.total_tokens = self.data.shape[0]
+                    self._load_one(pt_file)
 
     def __len__(self):
         return self.total_tokens
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        # Resolve the (shard, within-shard) index lazily. Shard count is small,
+        # so a linear scan is fine.
+        for i, off in enumerate(self._offsets):
+            shard = self._shards[i]
+            if idx < off + shard.shape[0]:
+                return shard[idx - off]
+        raise IndexError(idx)
 
 
 class ActivationDataLoader(DataLoader):
@@ -113,14 +126,22 @@ class ActivationDataLoader(DataLoader):
             return torch.stack(batch).to(device)
 
         # Use a dedicated generator seeded once per DataLoader so shuffling is
-        # reproducible AND the global RNG is not disturbed.
-        gen = torch.Generator()
-        gen.manual_seed(seed)
+        # reproducible AND the global RNG is not disturbed. `reseed()` advances
+        # it each epoch so consecutive epochs do not repeat the same order.
+        self.seed = seed
+        self._epoch = 0
+        self.generator = torch.Generator()
+        self.generator.manual_seed(seed)
 
         super().__init__(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            generator=gen,
+            generator=self.generator,
             collate_fn=collate_fn,
         )
+
+    def reseed(self):
+        """Advance the shuffle seed so the next epoch uses a different order."""
+        self._epoch += 1
+        self.generator.manual_seed(self.seed + self._epoch)

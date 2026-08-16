@@ -1,6 +1,7 @@
 import os
 import json
 import shutil
+import contextlib
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
@@ -46,11 +47,42 @@ class Trainer:
             weight_decay=float(config.weight_decay),
         )
 
+        # Mixed precision (AMP): fp16 uses a GradScaler (gradients can underflow);
+        # bf16 needs none. Only enabled on CUDA — on CPU we fall back to fp32.
+        self.use_amp = bool(getattr(config, "fp16", False))
+        self.use_bf16 = bool(getattr(config, "bf16", False))
+        if self.use_amp and self.use_bf16:
+            raise ValueError("Enable only one of fp16 / bf16")
+        if (self.use_amp or self.use_bf16) and self.device.type != "cuda":
+            print(f"[AMP] fp16/bf16 requested but running on {self.device.type}; "
+                  "mixed precision disabled (trains in fp32). Use a CUDA GPU.")
+            self.use_amp = self.use_bf16 = False
+        if self.use_amp:
+            self.amp_dtype = torch.float16
+            # torch.amp.GradScaler("cuda") (torch>=2.3); fall back to the legacy
+            # torch.cuda.amp.GradScaler for older torch (>=2.0, as declared).
+            if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+                self.scaler = torch.amp.GradScaler("cuda", enabled=True)
+            else:
+                self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+        elif self.use_bf16:
+            self.amp_dtype = torch.bfloat16
+            self.scaler = None  # bf16 needs no gradient scaling
+        else:
+            self.amp_dtype = None
+            self.scaler = None
+
         self.global_step = 0
         self.epoch = 0
         self.best_f1 = 0.0
         self.best_checkpoints = []
         self.eval_history = []
+
+    def _autocast(self):
+        """Context manager for mixed precision; no-op when AMP is off."""
+        if self.amp_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype)
 
     def _get_dataloader(self, dataset, shuffle):
         return DataLoader(
@@ -87,7 +119,13 @@ class Trainer:
     def train(self):
         train_loader = self._get_dataloader(self.train_dataset, shuffle=True)
 
-        num_update_steps_per_epoch = len(train_loader) // int(self.config.gradient_accumulation_steps)
+        # Updates per epoch: ceil(len/grad_accum) — the trailing partial
+        # accumulation is flushed at the end of each epoch. At least 1, so
+        # grad_accum > len(train_loader) doesn't zero-divide current_epoch.
+        grad_accum = int(self.config.gradient_accumulation_steps)
+        num_update_steps_per_epoch = max(
+            1, (len(train_loader) + grad_accum - 1) // grad_accum
+        )
         if int(self.config.max_steps) > 0:
             num_training_steps = int(self.config.max_steps)
             num_epochs = int(self.config.num_train_epochs)
@@ -121,36 +159,50 @@ class Trainer:
 
             for step, batch in enumerate(progress_bar):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                outputs = self.model.model(**batch)
-                logits = outputs.logits
-                if loss_fct is not None:
-                    loss = loss_fct(
-                        logits.view(-1, logits.size(-1)),
-                        batch["labels"].view(-1),
-                    )
-                else:
-                    loss = outputs.loss
+                with self._autocast():
+                    outputs = self.model.model(**batch)
+                    logits = outputs.logits
+                    if loss_fct is not None:
+                        loss = loss_fct(
+                            logits.view(-1, logits.size(-1)),
+                            batch["labels"].view(-1),
+                        )
+                    else:
+                        loss = outputs.loss
                 loss = loss / int(self.config.gradient_accumulation_steps)
-                loss.backward()
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
                 train_loss += loss.item()
                 epoch_loss += loss.item()
 
-                if (step + 1) % int(self.config.gradient_accumulation_steps) == 0:
+                if ((step + 1) % grad_accum == 0) or (step == len(train_loader) - 1):
+                    if self.scaler is not None:
+                        self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.model.parameters(), float(self.config.max_grad_norm)
                     )
-                    self.optimizer.step()
+                    if self.scaler is not None:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
                     lr_scheduler.step()
                     self.optimizer.zero_grad()
                     self.global_step += 1
                     current_epoch = self.global_step / num_update_steps_per_epoch
 
                     if self.global_step % int(self.config.logging_steps) == 0:
-                        avg_loss = train_loss / max(1, int(self.config.logging_steps) * int(self.config.gradient_accumulation_steps))
+                        # train_loss already accumulated loss/grad_accum per batch,
+                        # so the mean over `logging_steps` optimizer steps is
+                        # train_loss / logging_steps (NOT * grad_accum).
+                        avg_loss = train_loss / max(1, int(self.config.logging_steps))
                         progress_bar.set_postfix({"loss": f"{avg_loss:.4f}"})
                         train_loss = 0.0
 
-                    if self.global_step % int(self.config.eval_steps) == 0 and self.eval_dataset:
+                    if (self.global_step % int(self.config.eval_steps) == 0
+                            and self.eval_dataset and len(self.eval_dataset) > 0):
                         eval_metrics = self.evaluate()
                         self.eval_history.append({
                             "epoch": round(current_epoch, 2),
@@ -181,7 +233,8 @@ class Trainer:
         with torch.no_grad():
             for batch in tqdm(eval_loader, desc="Evaluating"):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                outputs = self.model.model(**batch)
+                with self._autocast():
+                    outputs = self.model.model(**batch)
                 total_loss += outputs.loss.item()
 
                 preds = outputs.logits.argmax(dim=-1)
@@ -190,7 +243,7 @@ class Trainer:
                     all_preds.extend(preds[i][mask].cpu().tolist())
                     all_labels.extend(batch["labels"][i][mask].cpu().tolist())
 
-        avg_loss = total_loss / len(eval_loader)
+        avg_loss = total_loss / len(eval_loader) if len(eval_loader) > 0 else 0.0
 
         accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / max(1, len(all_preds))
         f1 = self._compute_f1(all_preds, all_labels)

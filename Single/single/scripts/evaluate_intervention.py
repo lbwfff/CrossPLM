@@ -47,6 +47,7 @@ def evaluate(
     scale: float = 2.0,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    source: Optional[str] = None,
     output_dir: Optional[Path] = None,
     layer: int = 6,
     label_column: str = "label",
@@ -63,7 +64,7 @@ def evaluate(
     # --sae_dir and --output_dir default into Outputs/<experiment>/.
     exp = None
     if sae_dir is None or output_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source)
     if sae_dir is None:
         sae_dir = exp.sae_dir
         print(f"  SAE dir (inferred): {sae_dir}")
@@ -156,7 +157,7 @@ def evaluate(
     print(f"\nSaved to {out_path}")
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Causal intervention on a single SAE feature")
     parser.add_argument("--ckpt_path", type=Path, required=True, help="Fine-tuned model checkpoint")
     parser.add_argument("--sequences_csv", type=Path, required=True, help="CSV with sequences+labels")
@@ -167,6 +168,8 @@ if __name__ == "__main__":
                         help="How to perturb the feature")
     parser.add_argument("--scale", type=float, default=2.0,
                         help="Multiplier (amplify) or value (set) for the perturbation")
+    parser.add_argument("--source", type=str, default=None,
+                        help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
     parser.add_argument("--experiment", type=str, default=None)
     parser.add_argument("--exp_dir", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, default=None)
@@ -178,5 +181,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--max_sequences", type=int, default=None,
                         help="Limit number of sequences for a quick test")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     evaluate(**vars(args))
+
+
+if __name__ == "__main__":
+    main()

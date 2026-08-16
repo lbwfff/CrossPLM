@@ -44,6 +44,7 @@ def analyze_features(
     output_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    source: Optional[str] = None,
     label_column: Optional[str] = None,
     sequences_csv: Optional[Path] = None,
     sequence_column: str = "sequence",
@@ -51,6 +52,8 @@ def analyze_features(
     n_top_features: int = 50,
     label_map: str = "mBMRB",
     max_length: int = 512,
+    min_seq_len: int = 0,
+    max_seq_len: int = 10_000,
     sae_dir: Optional[Path] = None,
 ):
     from single.paths import resolve_experiment
@@ -59,7 +62,7 @@ def analyze_features(
     # remain overridable explicitly.
     exp = None
     if sae_dir is None or output_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source)
     if sae_dir is None:
         sae_dir = exp.sae_dir
         print(f"  SAE dir (inferred): {sae_dir}")
@@ -126,7 +129,8 @@ def analyze_features(
     if labels is None and sequences_csv is not None and label_column is not None:
         print("\n3. Parsing labels from CSV (replicating extract_embeddings shuffle+shard)...")
         from single.data import load_sequences_df, shuffled_shards
-        df = load_sequences_df(sequences_csv, sequence_column=sequence_column)
+        df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
+                               min_seq_len=min_seq_len, max_seq_len=max_seq_len)
         df[label_column] = df[label_column].fillna("").astype(str)
         if sequence_column not in df.columns:
             raise ValueError(
@@ -267,11 +271,13 @@ def analyze_features(
     print(f"{'=' * 60}")
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Analyze SAE features against task labels")
     parser.add_argument("--sae_dir", type=Path, default=None,
                         help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     parser.add_argument("--embeddings_dir", type=Path, required=True)
+    parser.add_argument("--source", type=str, default=None,
+                        help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
     parser.add_argument("--experiment", type=str, default=None,
                         help="Experiment name; creates Outputs/<experiment>_<ts>/")
     parser.add_argument("--exp_dir", type=Path, default=None,
@@ -288,5 +294,13 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=512,
                         help="Max length used at embedding extraction; labels are "
                              "truncated to max_length-2 to match truncated sequences")
-    args = parser.parse_args()
+    parser.add_argument("--min_seq_len", type=int, default=0,
+                        help="Must match extract_embeddings --min_seq_len")
+    parser.add_argument("--max_seq_len", type=int, default=10000,
+                        help="Must match extract_embeddings --max_seq_len")
+    args = parser.parse_args(argv)
     analyze_features(**{k: v for k, v in vars(args).items() if v is not None})
+
+
+if __name__ == "__main__":
+    main()

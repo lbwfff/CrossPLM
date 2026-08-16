@@ -37,6 +37,7 @@ def extract_embeddings(
     output_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    source: Optional[str] = None,
     layer: int = 6,
     batch_size: int = 8,
     max_length: int = 512,
@@ -51,7 +52,7 @@ def extract_embeddings(
 
     # Prefer explicit output_dir (legacy); else route into the experiment dir.
     if output_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source)
         output_dir = exp.embeddings_dir(layer=layer)
         print(f"Experiment dir: {exp.dir}")
     output_dir = Path(output_dir)
@@ -121,10 +122,12 @@ def extract_embeddings(
     print("Done!")
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Extract hidden states from fine-tuned ESM2-8M")
     parser.add_argument("--ckpt_path", type=Path, required=True, help="Path to fine-tuned model checkpoint")
     parser.add_argument("--sequences_csv", type=Path, required=True, help="CSV with sequences and labels")
+    parser.add_argument("--source", type=str, default=None,
+                        help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
     parser.add_argument("--experiment", type=str, default=None,
                         help="Experiment name; creates Outputs/<experiment>_<ts>/")
     parser.add_argument("--exp_dir", type=Path, default=None,
@@ -143,5 +146,9 @@ if __name__ == "__main__":
                         help="Drop sequences shorter than this (must match concept build)")
     parser.add_argument("--max_seq_len", type=int, default=10000,
                         help="Drop sequences longer than this (must match concept build)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     extract_embeddings(**vars(args))
+
+
+if __name__ == "__main__":
+    main()

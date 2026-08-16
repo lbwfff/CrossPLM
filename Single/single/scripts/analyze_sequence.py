@@ -50,7 +50,9 @@ def analyze(
     feature_indices: List[int],
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    source: Optional[str] = None,
     output_dir: Optional[Path] = None,
+    sequence_column: str = "sequence",
     layer: int = 6,
     shard: int = 0,
     n_shards: int = 5,
@@ -66,7 +68,7 @@ def analyze(
     # --sae_dir and --output_dir default into Outputs/<experiment>/.
     exp = None
     if sae_dir is None or output_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source)
     if sae_dir is None:
         sae_dir = exp.sae_dir
         print(f"  SAE dir (inferred): {sae_dir}")
@@ -110,11 +112,12 @@ def analyze(
     print(f"\nRebuilding protein/residue mapping from {sequences_csv}...")
     df, shard_proteins, shard_respos = build_residue_positions(
         sequences_csv, [shard], n_shards=n_shards, max_residues=max_residues,
+        sequence_column=sequence_column,
         min_seq_len=min_seq_len, max_seq_len=max_seq_len,
     )
     protein_ids = shard_proteins[shard]
     respos = shard_respos[shard]
-    proteins = df["sequence"].astype(str).tolist()
+    proteins = df[sequence_column].astype(str).tolist()
     print(f"  {len(protein_ids):,} tokens mapped to {len(proteins)} proteins")
 
     # Compute protein lengths (for the random null distribution in Cohen's d)
@@ -177,13 +180,17 @@ def analyze(
     print(f"\nSaved to {out_path}")
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Sequence-level SAE feature analysis")
     parser.add_argument("--sae_dir", type=Path, default=None,
                         help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     parser.add_argument("--embeddings_dir", type=Path, required=True)
     parser.add_argument("--sequences_csv", type=Path, required=True)
+    parser.add_argument("--sequence_column", type=str, default="sequence",
+                        help="Column holding the protein sequence")
     parser.add_argument("--feature_indices", type=int, nargs="+", required=True)
+    parser.add_argument("--source", type=str, default=None,
+                        help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
     parser.add_argument("--experiment", type=str, default=None)
     parser.add_argument("--exp_dir", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, default=None)
@@ -198,5 +205,9 @@ if __name__ == "__main__":
                         help="Must match extract_embeddings --min_seq_len")
     parser.add_argument("--max_seq_len", type=int, default=10000,
                         help="Must match extract_embeddings --max_seq_len")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     analyze(**vars(args))
+
+
+if __name__ == "__main__":
+    main()

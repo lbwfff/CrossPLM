@@ -16,6 +16,10 @@ Core idea (from InterPLM, adapted from MLM to token classification):
   0% means it is as harmful as zeroing the layer.
 """
 
+# `torch.Tensor | None` (PEP 604) annotations require Python >=3.10; this keeps
+# them working on Python 3.9 (as declared by setup.py).
+from __future__ import annotations
+
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -329,7 +333,10 @@ def evaluate_intervention(
 
         # Steered logits (perturb one feature). Encode once; reuse for both the
         # active-mask and the steering (avoids a redundant SAE encode pass).
-        f = sae.encode(hidden)  # [B, L, dict_size]
+        # Mirror forward()'s normalization so normalize_to_sqrt_d=True is
+        # respected (encode/decode alone bypass it).
+        hidden_n, norms = sae._normalize_input_and_get_norms(hidden)
+        f = sae.encode(hidden_n)  # [B, L, dict_size]
         active_mask = f[..., feature_idx] > 0  # tokens where the feature fires
         f_steered = f.clone()
         if mode == "zero":
@@ -340,7 +347,7 @@ def evaluate_intervention(
             f_steered[..., feature_idx] = scale
         else:
             raise ValueError(f"Unknown mode: {mode} (use zero/amplify/set)")
-        steered = sae.decode(f_steered)
+        steered = sae._unnormalize_output(sae.decode(f_steered), norms)
         steer_logits = _model_logits_with_override(
             model, tokens, attn, injection, steered
         )

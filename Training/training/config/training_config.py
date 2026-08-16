@@ -14,7 +14,7 @@ class TrainingConfig:
 
     task_type: str = "token_classification"
     max_seq_length: int = 512
-    mlm_probability: float = 0.15
+    mlm_probability: float = 0.15  # reserved (MLM task not implemented)
 
     per_device_train_batch_size: int = 8
     per_device_eval_batch_size: int = 8
@@ -36,11 +36,11 @@ class TrainingConfig:
     save_total_limit: int = 3
     seed: int = 42
     dataloader_num_workers: int = 2
-    fp16: bool = False
-    bf16: bool = False
+    fp16: bool = False  # mixed precision (AMP) — requires a CUDA GPU
+    bf16: bool = False  # bfloat16 AMP — requires a CUDA GPU (Ampere+)
     class_weight_method: str = "inverse"
     ignore_pad_token_for_loss: bool = True
-    resume_from_checkpoint: Optional[str] = None
+    resume_from_checkpoint: Optional[str] = None  # reserved (not implemented)
     # Optional label-map preset (from Single's single/label_maps.py) or a path to
     # a YAML label-map file. This is the SAME label encoding used by the
     # interpretability module, so Training and Single always interpret a dataset
@@ -80,7 +80,7 @@ class TrainingConfig:
 # CrossPLM Training Config Template
 # ============================================================
 # Edit this file, then run:
-#   python crossplm.py train --config <path>
+#   python crossplm.py training train --config <path>
 # ============================================================
 
 # Task name (for identification only)
@@ -114,13 +114,13 @@ label_column: label
 # Train/eval split ratio (0~1), the rest is used for eval
 train_ratio: 0.9
 
-# Task type: token_classification | mlm
+# Task type: token_classification (mlm not implemented)
 task_type: token_classification
 
 # Max sequence length; longer sequences are truncated
 max_seq_length: 512
 
-# Only used when task_type=mlm, mask probability
+# Reserved for a future MLM task (currently unused)
 mlm_probability: 0.15
 
 # ----- Training hyperparameters -----
@@ -147,8 +147,8 @@ class_weight_method: inverse
 # ----- Other -----
 seed: 42
 dataloader_num_workers: 2
-fp16: false
-bf16: false
+fp16: false          # mixed precision (AMP) — requires a CUDA GPU
+bf16: false          # bfloat16 AMP — requires a CUDA GPU (Ampere+); prefer over fp16
 """
         with open(path, "w") as f:
             f.write(template.lstrip())

@@ -84,7 +84,7 @@ def main():
                         default=os.path.join(os.path.dirname(__file__), "..", "Dataset", "relaxdb_data.csv"),
                         help="Path to relaxdb_data.csv")
     parser.add_argument("--output", type=str,
-                        default=os.path.join("..", "Training", "examples", "relaxdb_processed.csv"),
+                        default=os.path.join(os.path.dirname(__file__), "..", "Training", "examples", "relaxdb_processed.csv"),
                         help="Output CSV path")
     args = parser.parse_args()
 

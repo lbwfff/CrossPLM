@@ -24,6 +24,8 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")  # headless-safe: figures are saved, never shown
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
@@ -140,6 +142,7 @@ def visualize_features(
     output_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    source: Optional[str] = None,
     sequences_csv: Optional[Path] = None,
     sequence_column: str = "sequence",
     label_column: Optional[str] = None,
@@ -157,7 +160,7 @@ def visualize_features(
 
     if experiment is None and exp_dir is None and embeddings_path is None and output_dir is None:
         raise ValueError("Must provide --experiment/--exp_dir (or an explicit path)")
-    exp = resolve_experiment(exp_dir=exp_dir, name=experiment) if (experiment or exp_dir) else None
+    exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source) if (experiment or exp_dir) else None
 
     # --sae_dir defaults into Outputs/<experiment>/sae but stays overridable.
     if sae_dir is None:
@@ -270,13 +273,15 @@ def visualize_features(
     print(f"\nVisualizations saved to {output_dir}")
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Visualize SAE feature activations on proteins")
     parser.add_argument("--sae_dir", type=Path, default=None,
                         help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     parser.add_argument("--embeddings_path", type=Path, default=None,
                         help="Embeddings shard file (default: inferred from experiment "
                              "as embeddings/layer_<N>/shard_<S>/embeddings.pt)")
+    parser.add_argument("--source", type=str, default=None,
+                        help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
     parser.add_argument("--experiment", type=str, default=None,
                         help="Experiment name; routes outputs into Outputs/<experiment>/")
     parser.add_argument("--exp_dir", type=Path, default=None,
@@ -301,5 +306,9 @@ if __name__ == "__main__":
     parser.add_argument("--n_features", type=int, default=10)
     parser.add_argument("--label_map", type=str, default="mBMRB",
                         help="Label encoding preset name or path to YAML label-map file")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     visualize_features(**{k: v for k, v in vars(args).items() if v is not None})
+
+
+if __name__ == "__main__":
+    main()

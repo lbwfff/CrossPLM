@@ -15,15 +15,48 @@ Dataset/  Preprocessing/   Training/        Single/        Outputs/
 
 | Directory | Role |
 |-----------|------|
-| `Dataset/` | Raw datasets (`mBMRB.csv`, `relaxdb_data.csv`), downloaded annotations (`uniprotkb_swissprot.tsv`), and label-map YAMLs (from `crossplm.py labelmap`) |
+| `Dataset/` | Raw datasets (`mBMRB.csv`, `relaxdb_data.csv`), downloaded annotations (`uniprotkb_swissprot.tsv`), and label-map YAMLs (from `crossplm.py training labelmap`) |
 | `Preprocessing/` | Dataset-specific label preprocessing scripts |
 | `Training/` | PLM fine-tuning framework (init / train / eval CLI) |
 | `Single/` | SAE-based interpretability: extract → train SAE → analyze |
 | `Outputs/` | All per-experiment outputs (embeddings, SAE, concepts, analysis) |
 | `Crossing/` | Planned: cross-model interpretability (not yet implemented) |
 
+---
+
+## Unified CLI
+
+All commands go through one entry point, `crossplm.py` at the repository root,
+grouped by module. Run from the repository root (no `cd`, no install needed):
+
+```bash
+# Training module
+python crossplm.py training init --task_name my_experiment
+python crossplm.py training train --config Outputs/my_experiment/config.yaml
+python crossplm.py training eval --checkpoint ... --csv Dataset/mBMRB.csv
+python crossplm.py training labelmap --name my_dataset
+
+# Single module
+python crossplm.py single extract_embeddings ...
+python crossplm.py single train_sae ...
+python crossplm.py single analyze_features ...
+python crossplm.py single analyze_concepts build|align|heldout ...
+python crossplm.py single analyze_sequence ...
+python crossplm.py single analyze_coactivation ...
+python crossplm.py single evaluate_fidelity ...
+python crossplm.py single evaluate_intervention ...
+python crossplm.py single visualize_features ...
+```
+
+With `pip install -e .` the same commands become the bare `crossplm` command
+(`crossplm training eval ...`, `crossplm single extract_embeddings ...`). The
+module-internal CLIs (`Training/training_cli.py`, `Single/single/scripts/*.py`)
+still work standalone.
+
 ```
 CrossPLM/
+├── crossplm.py                  # Unified CLI (training | single)
+├── setup.py                     # Optional: pip install -e . -> `crossplm` command
 ├── Dataset/                     # Raw datasets
 │   ├── relaxdb_data.csv
 │   └── mBMRB.csv
@@ -31,11 +64,10 @@ CrossPLM/
 │   ├── preprocess_relaxdb.py
 │   └── preprocess_mbmrb.py
 ├── Training/                    # PLM training framework
-│   ├── crossplm.py              # Unified CLI (init / train / eval)
-│   ├── crossplm/                # Python package
+│   ├── training_cli.py          # `crossplm training` implementation
+│   ├── training/                # Python package
 │   └── examples/                # Sample data and configs
 ├── Single/                      # SAE-based interpretability
-│   ├── setup.py
 │   └── single/
 │       ├── configs.py           # Configuration dataclasses
 │       ├── label_maps.py        # Configurable label encoding for datasets
@@ -44,7 +76,7 @@ CrossPLM/
 │       ├── sae/                 # SAE architectures (ReLUSAE, TopKSAE)
 │       ├── train/               # SAE training loop
 │       ├── analysis/            # Feature-to-label & feature-to-concept alignment
-│       └── scripts/             # CLI scripts
+│       └── scripts/             # CLI scripts (`crossplm single` delegation)
 ├── Outputs/                     # SHARED experiment root (Training + Single)
 │   └── <experiment>/            # config, checkpoints, embeddings, sae, concepts, analysis
 └── README.md
@@ -80,7 +112,7 @@ only exist to produce relabeled `0/1` CSVs; with a label map you can skip them.
 
 **Generate an empty template** into `Dataset/` (shared by both modules):
 ```bash
-python Training/crossplm.py labelmap --name my_dataset
+python crossplm.py training labelmap --name my_dataset
 # → Dataset/my_dataset.yaml
 ```
 Then reference it in a config as `label_map: ../Dataset/my_dataset.yaml` or via
@@ -90,7 +122,7 @@ Then reference it in a config as `label_map: ../Dataset/my_dataset.yaml` or via
 ### 1. Initialize a Task
 ```bash
 # run from the repository root (no cd needed)
-python Training/crossplm.py init --task_name my_experiment
+python crossplm.py training init --task_name my_experiment
 ```
 → Creates `Outputs/my_experiment/config.yaml` template (verbatim name, no timestamp,
 shared with the Single module's `Outputs/<experiment>` root).
@@ -98,7 +130,7 @@ shared with the Single module's `Outputs/<experiment>` root).
 ### 2. Edit Config → Train
 Edit `Outputs/my_experiment/config.yaml`, then:
 ```bash
-python Training/crossplm.py train --config Outputs/my_experiment/config.yaml
+python crossplm.py training train --config Outputs/my_experiment/config.yaml
 ```
 → Checkpoints, training curve, and logs are saved inside the experiment folder.
 
@@ -111,7 +143,7 @@ from the CSV (legacy).
 
 ### 3. Evaluate a Checkpoint
 ```bash
-python Training/crossplm.py eval \
+python crossplm.py training eval \
   --checkpoint Outputs/my_experiment/checkpoints/best \
   --csv Dataset/mBMRB.csv \
   --label_map mBMRB
@@ -140,6 +172,7 @@ ignored (`-100`), consistent with training.
 | **Configurable label maps** | `label_map:` in the config uses Single's presets (`mBMRB`, `relaxdb`, `ss3`) or a YAML file, instead of inferring from the CSV |
 | **Multi-class support** | Correct class count for many-to-one label maps (mBMRB, relaxdb, ss3) |
 | **Metrics** | Loss + Accuracy + Macro F1 + AUPRC (macro over all classes) |
+| **Mixed precision** | `fp16` / `bf16` AMP on CUDA GPUs (auto-disabled on CPU) |
 | **Top-3 checkpoints** | Keeps best 3 by F1, cleans old ones automatically; `checkpoints/best` is a stable alias for the highest-F1 checkpoint |
 | **Training curve** | Auto-generated epoch–F1 plot after training |
 | **Eval plots** | Confusion matrix + Precision-Recall curve |
@@ -191,19 +224,25 @@ Each feature can then be interpreted by checking **when** it activates:
 
 ### Shared Conventions
 
-**Experiment directory.** Every step routes outputs into one directory,
-`Outputs/<experiment>/` (the name is used verbatim, no timestamp), the **same
-root the Training module uses**. Re-running a step with the same name reuses the
-directory (e.g. overwrites `model.pt`). Use distinct names for distinct runs, or
-`--exp_dir <existing_dir>` to point at one directly.
+**Experiment directory & data source.** Every step routes outputs into one
+experiment directory `Outputs/<experiment>/` (the name is used verbatim, no
+timestamp), the **same root the Training module uses**. The optional
+`--source <id>` flag (the input dataset, e.g. `mbmrb` / `swissprot`) nests
+data-specific dirs under `Outputs/<experiment>/<source>/`, so different datasets
+can share one experiment without overwriting each other. Without `--source`,
+everything lives flat under `Outputs/<experiment>/` (legacy). The **SAE is
+shared** at the experiment root and reused across sources. Re-running a step
+reuses the directory (e.g. overwrites `model.pt`); `--exp_dir <existing_dir>`
+points at a directory verbatim.
 
 ```
 Outputs/<experiment>/
-    embeddings/layer_<N>/shard_<i>/embeddings.pt
-    sae/model.pt           # trained SAE weights
+    sae/model.pt            # ONE shared SAE (reused across sources)
     sae/model_normalized.pt # per-feature max-activation rescale (see below)
-    concepts/shard_<i>/concept_matrix.npz
-    analysis/*.csv|*.json|visualizations/
+    <source>/               # e.g. mbmrb | swissprot  (--source <id>)
+        embeddings/layer_<N>/shard_<i>/embeddings.pt
+        concepts/shard_<i>/concept_matrix.npz
+        analysis/*.csv|*.json|visualizations/
 ```
 
 **Feature normalization.** `analyze_features` computes each feature's max
@@ -255,28 +294,28 @@ Align each SAE feature with the task labels (e.g. rigid/flexible) to find
 "flexibility detectors".
 
 ```bash
-# Extract hidden states from the fine-tuned model (creates Outputs/mb/)
-python Single/single/scripts/extract_embeddings.py \
+# Extract hidden states from the fine-tuned model (creates Outputs/demo/mbmrb/)
+python crossplm.py single extract_embeddings \
     --ckpt_path Outputs/my_task/checkpoints/best \
     --sequences_csv Dataset/mBMRB.csv \
-    --experiment mb \
+    --experiment demo --source mbmrb \
     --label_column label --label_map mBMRB
 
 # Train SAE (320-dim → 640 features; embeddings inferred, all shards by default)
-python Single/single/scripts/train_sae.py \
-    --experiment mb \
+python crossplm.py single train_sae \
+    --experiment demo --source mbmrb \
     --batch_size 64 --dict_size 640 --steps 20000 --l1_penalty 0.08 \
     --resample_steps 2000
 
 # Align features with task labels
-python Single/single/scripts/analyze_features.py \
-    --embeddings_dir Outputs/mb/embeddings/layer_6 \
-    --experiment mb \
+python crossplm.py single analyze_features \
+    --embeddings_dir Outputs/demo/mbmrb/embeddings/layer_6 \
+    --experiment demo --source mbmrb \
     --sequences_csv Dataset/mBMRB.csv --label_column label --label_map mBMRB
 
 # Visualize top features on sequences (embeddings_path inferred from experiment)
-python Single/single/scripts/visualize_features.py \
-    --experiment mb \
+python crossplm.py single visualize_features \
+    --experiment demo --source mbmrb \
     --sequences_csv Dataset/mBMRB.csv \
     --feature_indices 234 426 --label_map mBMRB
 ```
@@ -302,8 +341,8 @@ Top features for 'flexible' (label=1):
 
 Align SAE features against **biological concepts** — e.g. "Helix",
 "Domain_kinase", "Binding_site_ATP" — to discover what real biology each feature
-encodes. Pipeline: build concept matrices, extract embeddings + train a separate
-SAE for this experiment, then align features to concepts
+encodes. Pipeline: build concept matrices, extract embeddings (reusing the SAE
+trained in §2.1), then align features to concepts
 (`single/scripts/analyze_concepts.py`).
 
 **Step 1: Build per-residue concept matrices from a UniProtKB TSV export.**
@@ -313,9 +352,9 @@ The TSV must contain `Entry`, `Sequence`, and Feature-table columns (`Helix`,
 Download from UniProt with `reviewed:true` → Export → TSV.
 
 ```bash
-python Single/single/scripts/analyze_concepts.py build \
+python crossplm.py single analyze_concepts build \
     --annotations_tsv Dataset/uniprotkb_swissprot.tsv \
-    --experiment sp \
+    --experiment demo --source swissprot \
     --n_shards 5 \
     --max_residues 510   # must equal embedder max_length - 2 (512 -> 510)
 ```
@@ -335,33 +374,27 @@ python Single/single/scripts/analyze_concepts.py build \
 **Extract embeddings from the SAME TSV** (must match the concept build above):
 
 ```bash
-python Single/single/scripts/extract_embeddings.py \
+python crossplm.py single extract_embeddings \
     --ckpt_path Outputs/my_task/checkpoints/best \
     --sequences_csv Dataset/uniprotkb_swissprot.tsv \
     --sequence_column Sequence \
-    --experiment sp \
+    --experiment demo --source swissprot \
     --n_shards 5 --min_seq_len 30 --max_seq_len 1022
 ```
 
 > No `--label_column` here — UniProt has no per-residue task labels; the embedder
 > only needs the `Sequence` column.
 
-**Train an SAE on the Swiss-Prot embeddings** (the `sp` experiment has its own
-`Outputs/sp/sae`, separate from `mb`):
-
-```bash
-python Single/single/scripts/train_sae.py \
-    --experiment sp \
-    --batch_size 64 --dict_size 640 --steps 20000 --l1_penalty 0.08 \
-    --resample_steps 2000
-```
+> **No second SAE needed.** The same SAE trained in §2.1 (on mBMRB) is reused
+> here — features are the same dictionary, so concept alignment measures whether
+> mBMRB-learned features capture Swiss-Prot biology.
 
 **Step 2: Align SAE features to concepts.**
 
 ```bash
-python Single/single/scripts/analyze_concepts.py align \
-    --embeddings_dir Outputs/sp/embeddings/layer_6 \
-    --experiment sp \
+python crossplm.py single analyze_concepts align \
+    --embeddings_dir Outputs/demo/swissprot/embeddings/layer_6 \
+    --experiment demo --source swissprot \
     --threshold_percents 0 0.15 0.5 0.6 0.8
 ```
 
@@ -392,9 +425,9 @@ features some score high purely by chance.
 3. On **test**, evaluate only the selected pairs (unbiased).
 
 ```bash
-python Single/single/scripts/analyze_concepts.py heldout \
-    --embeddings_dir Outputs/sp/embeddings/layer_6 \
-    --experiment sp \
+python crossplm.py single analyze_concepts heldout \
+    --embeddings_dir Outputs/demo/swissprot/embeddings/layer_6 \
+    --experiment demo --source swissprot \
     --split_mode half \
     --threshold_percents 0 0.15 0.5 0.6 0.8
 ```
@@ -415,10 +448,10 @@ Loss_Recovered = 1 - (ce_sae - ce_orig) / (ce_zero - ce_orig)
 100% = perfectly preserves task info; 0% = as harmful as zeroing the layer.
 
 ```bash
-python Single/single/scripts/evaluate_fidelity.py \
+python crossplm.py single evaluate_fidelity \
     --ckpt_path Outputs/my_task/checkpoints/best \
     --sequences_csv Dataset/mBMRB.csv \
-    --experiment mb \
+    --experiment demo --source mbmrb \
     --layer 6 --label_column label --label_map mBMRB \
     --max_sequences 200
 ```
@@ -426,10 +459,11 @@ Saves `fidelity_results.json` incl. a `reconstruction_mse` sanity check.
 `--max_sequences` limits to a subset for a quick check — drop it to evaluate the
 whole dataset.
 
-> **Data consistency:** each experiment keeps its own `embeddings/`, `sae/`,
-> `concepts/`, `analysis/` dirs, so running `sp` does not overwrite `mb`. Fidelity
-> and intervention must use the SAE trained on the **same data** as the sequences
-> they feed (`--experiment mb` + mBMRB).
+> **Data consistency:** `--source` keeps different datasets in separate
+> subdirs (`Outputs/<experiment>/mbmrb/` vs `.../swissprot/`), so they never
+> overwrite each other; the SAE is shared at the experiment root. Fidelity and
+> intervention must use the sequences that match the analysis (`--source mbmrb`
+> + mBMRB here).
 
 **Note:** injection currently supports the final layer only
 (`hidden_states[6]` = `emb_layer_norm_after` output).
@@ -441,10 +475,10 @@ change — establishing that the feature *causally drives* (not just co-occurs
 with) the model's decision.
 
 ```bash
-python Single/single/scripts/evaluate_intervention.py \
+python crossplm.py single evaluate_intervention \
     --ckpt_path Outputs/my_task/checkpoints/best \
     --sequences_csv Dataset/mBMRB.csv \
-    --experiment mb \
+    --experiment demo --source mbmrb \
     --feature_idx 375 --mode zero \
     --label_column label --label_map mBMRB \
     --layer 6 --max_sequences 200
@@ -478,10 +512,10 @@ sequence data (no 3D structures required):
   "signature" of the feature.
 
 ```bash
-python Single/single/scripts/analyze_sequence.py \
-    --embeddings_dir Outputs/mb/embeddings/layer_6 \
+python crossplm.py single analyze_sequence \
+    --embeddings_dir Outputs/demo/mbmrb/embeddings/layer_6 \
     --sequences_csv Dataset/mBMRB.csv \
-    --experiment mb \
+    --experiment demo --source mbmrb \
     --feature_indices 375 42 \
     --shard 0
 ```
@@ -502,10 +536,10 @@ Answers whether two features activate on the **same residues**, on residues
 redundant vs complementary (co-regulatory) features.
 
 ```bash
-python Single/single/scripts/analyze_coactivation.py \
-    --embeddings_dir Outputs/mb/embeddings/layer_6 \
+python crossplm.py single analyze_coactivation \
+    --embeddings_dir Outputs/demo/mbmrb/embeddings/layer_6 \
     --sequences_csv Dataset/mBMRB.csv \
-    --experiment mb \
+    --experiment demo --source mbmrb \
     --feature_a 375 --feature_b 42 \
     --shard 0
 ```
@@ -545,9 +579,11 @@ clustered biology (e.g. a catalytic pocket). *Requires PDB/AlphaFold structures.
 ```bash
 pip install -r requirements.txt
 ```
-Or install the SAE package in development mode (pulls deps from `setup.py`):
+
+Optional — a **single** install gets both the bare `crossplm` command and the
+`single` package (importable from anywhere):
 ```bash
-pip install -e Single/
+pip install -e .          # → `crossplm` command + `single` package
 ```
 
 ---
@@ -570,33 +606,35 @@ Outputs/
     │   ├── final/                                 # Final checkpoint
     │   └── ...                                    # each contains label_map.json
     ├── evaluations/<csv_name>/                    # PLM eval (metrics.json, plots)
-    ├── embeddings/layer_<N>/shard_<i>/embeddings.pt   # Hidden states
-    ├── sae/
+    ├── sae/                                       # ONE shared SAE (reused)
     │   ├── model.pt                               # SAE weights
     │   ├── model_normalized.pt                    # Max-activation rescaled SAE
-    │   └── checkpoints/step_<N>/                  # Resumable SAE checkpoints
-    ├── concepts/
-    │   ├── shard_<i>/concept_matrix.npz           # Per-residue concepts
-    │   ├── shard_<i>/residues.csv                 # Residue metadata
-    │   └── concept_columns.txt
-    └── analysis/
-        ├── feature_label_metrics.json             # Task-label alignment
-        ├── feature_label_correlations.npy         # Point-biserial r per feature
-        ├── activation_profile.npz                 # Per-class mean/max activation
-        ├── max_activations_per_feature.pt         # Used to build model_normalized.pt
-        ├── feature_concept_pairs.csv              # Feature × concept alignment
-        ├── heldout_*.csv                          # Held-out validation
-        ├── fidelity_results.json                  # Fidelity
-        ├── intervention_feat<N>_<mode>.json       # Causal intervention
-        ├── sequence_analysis_shard<N>.json        # Cohen's d + motif
-        ├── coactivation_<a>_<b>_shard<N>.json     # Pairwise co-activation
-        └── visualizations/                        # PNG plots
+    │   └── checkpoints/step_<N>/                  # Resumable SAE checkpoints (newest N kept)
+    └── <source>/                                  # per --source <id>, e.g. mbmrb/swissprot
+        ├── embeddings/layer_<N>/shard_<i>/embeddings.pt   # Hidden states
+        ├── concepts/
+        │   ├── shard_<i>/concept_matrix.npz       # Per-residue concepts
+        │   ├── shard_<i>/residues.csv             # Residue metadata
+        │   └── concept_columns.txt
+        └── analysis/
+            ├── feature_label_metrics.json         # Task-label alignment
+            ├── feature_label_correlations.npy     # Point-biserial r per feature
+            ├── activation_profile.npz             # Per-class mean/max activation
+            ├── max_activations_per_feature.pt     # Used to build model_normalized.pt
+            ├── feature_concept_pairs.csv          # Feature × concept alignment
+            ├── heldout_*.csv                      # Held-out validation
+            ├── fidelity_results.json              # Fidelity
+            ├── intervention_feat<N>_<mode>.json   # Causal intervention
+            ├── sequence_analysis_shard<N>.json    # Cohen's d + motif
+            ├── coactivation_<a>_<b>_shard<N>.json # Pairwise co-activation
+            └── visualizations/                    # PNG plots
 ```
 
-`single/paths.py` centralizes these paths. `--sae_dir` / `--embeddings_dir` /
-`--output_dir` / `--save_dir` / `--concepts_dir` default into the experiment dir
-and can be overridden explicitly; `--exp_dir <path>` points at an existing
-experiment dir verbatim.
+`single/paths.py` centralizes these paths. `--source <id>` nests the data-specific
+dirs under `Outputs/<experiment>/<source>/` (flat when omitted). `--sae_dir` /
+`--embeddings_dir` / `--output_dir` / `--save_dir` / `--concepts_dir` default into
+the experiment dir and can be overridden explicitly; `--exp_dir <path>` points at
+an existing experiment dir verbatim.
 
 ---
 

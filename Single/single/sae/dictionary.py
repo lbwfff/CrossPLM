@@ -11,7 +11,11 @@ class Dictionary(ABC, nn.Module):
 
     def __init__(self, normalize_to_sqrt_d=False):
         super().__init__()
-        self.normalize_to_sqrt_d = normalize_to_sqrt_d
+        # Register as a buffer so it is persisted in state_dict and restored by
+        # from_pretrained (a plain attribute would silently reset to False).
+        self.register_buffer(
+            "normalize_to_sqrt_d", t.as_tensor(bool(normalize_to_sqrt_d))
+        )
 
     def _normalize_input_and_get_norms(self, x):
         if self.normalize_to_sqrt_d:
@@ -105,11 +109,13 @@ class ReLUSAE(Dictionary):
     def from_pretrained(cls, path, device=None):
         if device is None:
             device = "cuda" if t.cuda.is_available() else "cpu"
-        state_dict = t.load(path, map_location=device)
+        state_dict = t.load(path, map_location=device, weights_only=True)
         dict_size, activation_dim = state_dict["encoder.weight"].shape
         normalize_to_sqrt_d = state_dict.get("normalize_to_sqrt_d", t.tensor(False)).item()
         sae = cls(activation_dim, dict_size, normalize_to_sqrt_d=normalize_to_sqrt_d)
-        sae.load_state_dict(state_dict)
+        # strict=False: old checkpoints predate the `normalize_to_sqrt_d` buffer,
+        # so their state_dict lacks that key; the constructor already set it.
+        sae.load_state_dict(state_dict, strict=False)
         return sae.to(device)
 
 
@@ -175,11 +181,13 @@ class TopKSAE(Dictionary):
     def from_pretrained(cls, path, k=None, device=None):
         if device is None:
             device = "cuda" if t.cuda.is_available() else "cpu"
-        state_dict = t.load(path, map_location=device)
+        state_dict = t.load(path, map_location=device, weights_only=True)
         dict_size, activation_dim = state_dict["encoder.weight"].shape
         if k is None:
             k = state_dict["k"].item()
         normalize_to_sqrt_d = state_dict.get("normalize_to_sqrt_d", t.tensor(False)).item()
         sae = cls(activation_dim, dict_size, k, normalize_to_sqrt_d=normalize_to_sqrt_d)
-        sae.load_state_dict(state_dict)
+        # strict=False: old checkpoints predate the `normalize_to_sqrt_d` buffer,
+        # so their state_dict lacks that key; the constructor already set it.
+        sae.load_state_dict(state_dict, strict=False)
         return sae.to(device)

@@ -47,6 +47,7 @@ def cmd_build(
     concepts_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    source: Optional[str] = None,
     n_shards: int = 5,
     min_seq_len: int = 30,
     max_seq_len: int = 1022,
@@ -56,7 +57,7 @@ def cmd_build(
     from single.paths import resolve_experiment
 
     if concepts_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source)
         concepts_dir = exp.concepts_dir
         print(f"Experiment dir: {exp.dir}")
     build_concept_matrix(
@@ -162,11 +163,11 @@ def _align_shards(
     return pd.DataFrame(all_pairs)
 
 
-def _resolve_dirs(concepts_dir, output_dir, experiment, exp_dir):
+def _resolve_dirs(concepts_dir, output_dir, experiment, exp_dir, source=None):
     from single.paths import resolve_experiment
 
     if concepts_dir is None or output_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source)
         print(f"Experiment dir: {exp.dir}")
         if concepts_dir is None:
             concepts_dir = exp.concepts_dir
@@ -175,12 +176,12 @@ def _resolve_dirs(concepts_dir, output_dir, experiment, exp_dir):
     return Path(concepts_dir), Path(output_dir)
 
 
-def _resolve_sae_dir(sae_dir, experiment, exp_dir):
-    """--sae_dir defaults into Outputs/<experiment>/sae but stays overridable."""
+def _resolve_sae_dir(sae_dir, experiment, exp_dir, source=None):
+    """--sae_dir defaults into Outputs/<experiment>/sae (shared) but stays overridable."""
     from single.paths import resolve_experiment
 
     if sae_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source)
         sae_dir = exp.sae_dir
         print(f"  SAE dir (inferred): {sae_dir}")
     return Path(sae_dir)
@@ -192,6 +193,7 @@ def cmd_align(
     output_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    source: Optional[str] = None,
     shard: Optional[int] = None,
     threshold_min_f1: float = 0.0,
     n_top_per_concept: int = 20,
@@ -205,9 +207,9 @@ def cmd_align(
 ):
     from single.analysis.concepts import load_concept_names
 
-    sae_dir = _resolve_sae_dir(sae_dir, experiment, exp_dir)
+    sae_dir = _resolve_sae_dir(sae_dir, experiment, exp_dir, source=source)
     concepts_dir, output_dir = _resolve_dirs(
-        concepts_dir, output_dir, experiment, exp_dir
+        concepts_dir, output_dir, experiment, exp_dir, source=source
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -263,6 +265,7 @@ def cmd_heldout(
     output_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    source: Optional[str] = None,
     split_mode: str = "half",
     threshold_min_f1: float = 0.0,
     feature_chunk_size: int = 200,
@@ -282,9 +285,9 @@ def cmd_heldout(
     from single.analysis.concepts import load_concept_names
     from single.analysis.heldout import report_heldout
 
-    sae_dir = _resolve_sae_dir(sae_dir, experiment, exp_dir)
+    sae_dir = _resolve_sae_dir(sae_dir, experiment, exp_dir, source=source)
     concepts_dir, output_dir = _resolve_dirs(
-        concepts_dir, output_dir, experiment, exp_dir
+        concepts_dir, output_dir, experiment, exp_dir, source=source
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -344,7 +347,7 @@ def cmd_heldout(
     print("Done!")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="SAE feature × Swiss-Prot concept alignment")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -352,6 +355,8 @@ def main():
     p_build = sub.add_parser("build", help="Build concept matrices from UniProt TSV")
     p_build.add_argument("--annotations_tsv", type=Path, required=True,
                          help="UniProtKB/Swiss-Prot TSV export")
+    p_build.add_argument("--source", type=str, default=None,
+                        help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
     p_build.add_argument("--experiment", type=str, default=None,
                          help="Experiment name; creates Outputs/<experiment>_<ts>/")
     p_build.add_argument("--exp_dir", type=Path, default=None,
@@ -371,6 +376,8 @@ def main():
     p_align.add_argument("--sae_dir", type=Path, default=None,
                          help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     p_align.add_argument("--embeddings_dir", type=Path, required=True)
+    p_align.add_argument("--source", type=str, default=None,
+                        help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
     p_align.add_argument("--experiment", type=str, default=None,
                          help="Experiment name; creates Outputs/<experiment>_<ts>/")
     p_align.add_argument("--exp_dir", type=Path, default=None,
@@ -401,6 +408,8 @@ def main():
     p_held.add_argument("--sae_dir", type=Path, default=None,
                         help="Trained SAE dir (default: Outputs/<experiment>/sae)")
     p_held.add_argument("--embeddings_dir", type=Path, required=True)
+    p_held.add_argument("--source", type=str, default=None,
+                        help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
     p_held.add_argument("--experiment", type=str, default=None,
                         help="Experiment name; creates Outputs/<experiment>_<ts>/")
     p_held.add_argument("--exp_dir", type=Path, default=None,
@@ -425,32 +434,57 @@ def main():
     p_held.add_argument("--heldout_f1_threshold", type=float, default=0.3,
                         help="Report held-out pairs with f1_per_domain above this")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.command == "build":
-        cmd_build(args.annotations_tsv, args.concepts_dir, args.experiment,
-                  args.exp_dir, args.n_shards, args.min_seq_len, args.max_seq_len,
-                  args.max_residues)
+        cmd_build(
+            annotations_tsv=args.annotations_tsv,
+            concepts_dir=args.concepts_dir,
+            experiment=args.experiment,
+            exp_dir=args.exp_dir,
+            source=args.source,
+            n_shards=args.n_shards,
+            min_seq_len=args.min_seq_len,
+            max_seq_len=args.max_seq_len,
+            max_residues=args.max_residues,
+        )
     elif args.command == "heldout":
-        cmd_heldout(args.embeddings_dir, args.concepts_dir,
-                    args.output_dir, args.experiment, args.exp_dir,
-                    args.split_mode, args.threshold_min_f1,
-                    args.feature_chunk_size, args.batch_size,
-                    compute_auroc=not args.no_auroc,
-                    compute_domain_f1=not args.no_domain_f1,
-                    min_positives=args.min_positives,
-                    threshold_percents=args.threshold_percents,
-                    heldout_f1_threshold=args.heldout_f1_threshold,
-                    sae_dir=args.sae_dir)
+        cmd_heldout(
+            embeddings_dir=args.embeddings_dir,
+            concepts_dir=args.concepts_dir,
+            output_dir=args.output_dir,
+            experiment=args.experiment,
+            exp_dir=args.exp_dir,
+            source=args.source,
+            split_mode=args.split_mode,
+            threshold_min_f1=args.threshold_min_f1,
+            feature_chunk_size=args.feature_chunk_size,
+            batch_size=args.batch_size,
+            compute_auroc=not args.no_auroc,
+            compute_domain_f1=not args.no_domain_f1,
+            min_positives=args.min_positives,
+            threshold_percents=args.threshold_percents,
+            heldout_f1_threshold=args.heldout_f1_threshold,
+            sae_dir=args.sae_dir,
+        )
     else:
-        cmd_align(args.embeddings_dir, args.concepts_dir,
-                  args.output_dir, args.experiment, args.exp_dir,
-                  args.shard, args.threshold_min_f1, args.n_top_per_concept,
-                  args.feature_chunk_size, args.batch_size,
-                  compute_auroc=not args.no_auroc,
-                  compute_domain_f1=not args.no_domain_f1,
-                  min_positives=args.min_positives,
-                  threshold_percents=args.threshold_percents,
-                  sae_dir=args.sae_dir)
+        cmd_align(
+            embeddings_dir=args.embeddings_dir,
+            concepts_dir=args.concepts_dir,
+            output_dir=args.output_dir,
+            experiment=args.experiment,
+            exp_dir=args.exp_dir,
+            source=args.source,
+            shard=args.shard,
+            threshold_min_f1=args.threshold_min_f1,
+            n_top_per_concept=args.n_top_per_concept,
+            feature_chunk_size=args.feature_chunk_size,
+            batch_size=args.batch_size,
+            compute_auroc=not args.no_auroc,
+            compute_domain_f1=not args.no_domain_f1,
+            min_positives=args.min_positives,
+            threshold_percents=args.threshold_percents,
+            sae_dir=args.sae_dir,
+        )
 
 
 if __name__ == "__main__":

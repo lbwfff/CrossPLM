@@ -51,6 +51,9 @@ def shuffled_shards(
     MUST match every other call site so embedding shards, concept shards, and
     protein mappings stay aligned.
     """
+    if len(df) == 0:
+        raise ValueError("shuffled_shards: input DataFrame is empty "
+                         "(no sequences after any length filter)")
     df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
     shard_size = int(np.ceil(len(df) / n_shards))
     return [df.iloc[i:i + shard_size].reset_index(drop=True)

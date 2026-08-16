@@ -67,7 +67,6 @@ class FineTunedESMEmbedder:
 
         all_embeddings = []
         all_labels = [] if return_labels else None
-        all_boundaries = []
 
         for i in range(0, len(sequences), batch_size):
             batch_seqs = sequences[i : i + batch_size]
@@ -103,16 +102,12 @@ class FineTunedESMEmbedder:
                     seq_preds = seq_logits.argmax(dim=-1)
                     all_labels.append(seq_preds)
 
-                boundaries = (i + seq_idx, len(all_embeddings) - 1)
-                all_boundaries.append(boundaries)
-
         embeddings = torch.cat(all_embeddings, dim=0)
 
         if return_labels:
             return {
                 "embeddings": embeddings,
                 "labels": torch.cat(all_labels, dim=0) if all_labels else None,
-                "boundaries": all_boundaries,
             }
 
         return embeddings

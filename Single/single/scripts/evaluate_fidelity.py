@@ -42,6 +42,7 @@ def evaluate(
     sae_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    source: Optional[str] = None,
     output_dir: Optional[Path] = None,
     layer: int = 6,
     label_column: str = "label",
@@ -57,7 +58,7 @@ def evaluate(
     # --sae_dir and --output_dir default into Outputs/<experiment>/.
     exp = None
     if sae_dir is None or output_dir is None:
-        exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+        exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source)
     if sae_dir is None:
         sae_dir = exp.sae_dir
         print(f"  SAE dir (inferred): {sae_dir}")
@@ -76,7 +77,9 @@ def evaluate(
 
     # Load model + tokenizer
     print(f"\nLoading fine-tuned model from {ckpt_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_path, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        ckpt_path, local_files_only=True, trust_remote_code=True,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or "<pad>"
     model = AutoModelForTokenClassification.from_pretrained(
@@ -145,12 +148,14 @@ def evaluate(
     print(f"\nSaved to {out_path}")
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate SAE fidelity on a fine-tuned PLM")
     parser.add_argument("--ckpt_path", type=Path, required=True, help="Fine-tuned model checkpoint")
     parser.add_argument("--sequences_csv", type=Path, required=True, help="CSV with sequences+labels")
     parser.add_argument("--sae_dir", type=Path, default=None,
                         help="Trained SAE dir (default: Outputs/<experiment>/sae)")
+    parser.add_argument("--source", type=str, default=None,
+                        help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
     parser.add_argument("--experiment", type=str, default=None)
     parser.add_argument("--exp_dir", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, default=None)
@@ -162,5 +167,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--max_sequences", type=int, default=None,
                         help="Limit number of sequences for a quick test")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     evaluate(**vars(args))
+
+
+if __name__ == "__main__":
+    main()

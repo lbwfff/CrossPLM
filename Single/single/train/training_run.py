@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 
 import torch as t
@@ -69,8 +70,10 @@ class SAETrainingRun:
             try:
                 batch = next(data_iter)
             except StopIteration:
-                # One pass over the dataset finished: start a new epoch and
-                # continue sampling fresh batches (so all tokens get used).
+                # One pass over the dataset finished: start a new epoch (with a
+                # fresh shuffle order, via reseed) and continue sampling so all
+                # tokens get used across varied batches.
+                self.data.reseed()
                 data_iter = iter(self.data)
                 batch = next(data_iter)
             loss_val = trainer.update(step, batch)
@@ -94,6 +97,7 @@ class SAETrainingRun:
                 trainer.save_checkpoint(ckpt_dir)
                 # Persist training_state so --resume_from can pick up the step.
                 t.save(self.training_state, ckpt_dir / "training_state.pt")
+                self._prune_checkpoints(save_dir)
 
         t.save(trainer.ae.state_dict(), save_dir / "model.pt")
         print(f"\n{'='*50}")
@@ -102,6 +106,25 @@ class SAETrainingRun:
         for k, v in final.items():
             print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
         print(f"{'='*50}")
+
+    def _prune_checkpoints(self, save_dir: Path):
+        """Keep only the newest `max_ckpts_to_keep` step_* checkpoint dirs."""
+        max_keep = int(getattr(self.checkpoint_cfg, "max_ckpts_to_keep", 3))
+        if max_keep <= 0:
+            return
+        ckpt_root = Path(save_dir) / "checkpoints"
+        if not ckpt_root.is_dir():
+            return
+        step_dirs = []
+        for d in ckpt_root.iterdir():
+            if d.is_dir() and d.name.startswith("step_"):
+                try:
+                    step_dirs.append((int(d.name.split("_")[1]), d))
+                except (IndexError, ValueError):
+                    continue  # ignore non-numeric step dirs
+        step_dirs.sort(key=lambda x: x[0], reverse=True)  # newest first
+        for _, d in step_dirs[max_keep:]:
+            shutil.rmtree(d, ignore_errors=True)
 
     @classmethod
     def from_configs(

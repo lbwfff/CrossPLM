@@ -87,6 +87,9 @@ def split_up_feature_list(total_features: int, max_feature_chunk_size: int = 256
 
 
 def normalize_sae_features(sae: Dictionary, max_per_feat: torch.Tensor) -> Dictionary:
+    # Clamp so never-activated features (max == 0) don't cause 0/0 -> NaN/Inf
+    # when encode() divides by the rescale factor.
+    max_per_feat = torch.clamp(max_per_feat, min=1e-8)
     if hasattr(sae, "activation_rescale_factor"):
         sae.activation_rescale_factor = max_per_feat
     else:

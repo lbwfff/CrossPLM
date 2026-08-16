@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""CrossPLM Training CLI
+"""CrossPLM Training CLI (invoked via the unified `crossplm training` command).
 
-Run from the repository root (no cd needed):
-
-  python Training/crossplm.py init --task_name my_experiment
-  python Training/crossplm.py train --config Outputs/my_experiment/config.yaml
-  python Training/crossplm.py eval --checkpoint Outputs/my_experiment/checkpoints/xxx --csv Dataset/mBMRB.csv
+  python crossplm.py training init --task_name my_experiment
+  python crossplm.py training train --config Outputs/my_experiment/config.yaml
+  python crossplm.py training eval --checkpoint Outputs/my_experiment/checkpoints/xxx --csv Dataset/mBMRB.csv
 """
 import os
 import sys
@@ -17,7 +15,7 @@ def _load_label_map(name):
     """Load a label-map spec (preset name or YAML file path).
 
     Uses the SAME label maps as the interpretability module
-    (Single/single/label_maps.py, made importable by crossplm/__init__.py) so
+    (Single/single/label_maps.py, made importable by training/__init__.py) so
     Training and Single interpret a dataset's per-residue labels identically.
     The spec carries the sequence/label column names, the char->class mapping,
     and ignore characters.
@@ -35,7 +33,7 @@ def _load_label_map(name):
 
 def cmd_labelmap(args):
     """Create an empty label-map YAML template in the repo's Dataset/ dir."""
-    import crossplm  # noqa: F401  (crossplm/__init__.py puts Single/ on sys.path)
+    import training  # noqa: F401  (training/__init__.py puts Single/ on sys.path)
     from single.label_maps import generate_template
 
     if args.output:
@@ -51,7 +49,7 @@ def cmd_labelmap(args):
 
 
 def cmd_init(args):
-    from crossplm import TrainingConfig, create_task_folder
+    from training import TrainingConfig, create_task_folder
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     # Shared top-level output root (same as the interpretability module):
@@ -67,7 +65,7 @@ def cmd_init(args):
     print(f"[Task Created] {task_dir}")
     print(f"[Config Template] {config_path}")
     print(f"Edit the config, then run (from the repository root):")
-    print(f"  python Training/crossplm.py train --config {config_path}")
+    print(f"  python crossplm.py training train --config {config_path}")
 
 
 def cmd_train(args):
@@ -75,7 +73,7 @@ def cmd_train(args):
     import numpy as np
     import torch
 
-    from crossplm import (
+    from training import (
         TrainingConfig, TokenClassificationDataset, load_data_from_csv,
         split_dataset, build_label_map, build_id2label, label_map_n_classes,
         compute_class_weights, PLMModel, Trainer,
@@ -183,7 +181,7 @@ def cmd_eval(args):
     from torch.utils.data import DataLoader
     from tqdm import tqdm
     from transformers import AutoModelForTokenClassification, AutoTokenizer
-    from crossplm.data.dataset import TokenClassificationDataset, load_data_from_csv, build_label_map, label_map_n_classes
+    from training.data.dataset import TokenClassificationDataset, load_data_from_csv, build_label_map, label_map_n_classes
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -387,7 +385,7 @@ def cmd_eval(args):
     return metrics
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="CrossPLM Training CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -418,7 +416,7 @@ def main():
     p_eval.add_argument("--sequence_column", type=str, default="sequence")
     p_eval.add_argument("--label_column", type=str, default="label")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.command == "init":
         cmd_init(args)

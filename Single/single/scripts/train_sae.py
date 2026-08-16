@@ -35,6 +35,7 @@ def train_sae(
     save_dir: Optional[Path] = None,
     experiment: Optional[str] = None,
     exp_dir: Optional[Path] = None,
+    source: Optional[str] = None,
     layer: int = 6,
     shard: Optional[int] = None,
     activation_dim: int = 320,
@@ -48,6 +49,7 @@ def train_sae(
     decay_start: int = 8000,
     resample_steps: Optional[int] = None,
     save_steps: int = 2000,
+    max_ckpts_to_keep: int = 3,
     seed: int = 42,
     resume_from: Optional[Path] = None,
 ):
@@ -56,7 +58,7 @@ def train_sae(
     # Resolve experiment dir first (needed for default embeddings/save paths).
     if experiment is None and exp_dir is None:
         raise ValueError("Must provide either --experiment or --exp_dir")
-    exp = resolve_experiment(exp_dir=exp_dir, name=experiment)
+    exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source)
     print(f"Experiment dir: {exp.dir}")
 
     # Prefer explicit embeddings_dir; else infer Outputs/<exp>/embeddings/layer_<N>
@@ -100,6 +102,7 @@ def train_sae(
     checkpoint_cfg = CheckpointConfig(
         save_dir=save_dir,
         save_steps=save_steps,
+        max_ckpts_to_keep=max_ckpts_to_keep,
     )
 
     print("=" * 60)
@@ -137,11 +140,13 @@ def train_sae(
     print("Done!")
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Train SAE on PLM embeddings")
     parser.add_argument("--embeddings_dir", type=Path, default=None,
                         help="Embeddings dir to train on (default: "
                              "Outputs/<experiment>/embeddings/layer_<N>, all shards)")
+    parser.add_argument("--source", type=str, default=None,
+                        help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
     parser.add_argument("--experiment", type=str, default=None,
                         help="Experiment name; routes outputs into Outputs/<experiment>/")
     parser.add_argument("--exp_dir", type=Path, default=None,
@@ -164,7 +169,13 @@ if __name__ == "__main__":
     parser.add_argument("--resample_steps", type=int, default=None,
                         help="Reinitialize dead neurons every N steps (reduces dead_pct)")
     parser.add_argument("--save_steps", type=int, default=2000)
+    parser.add_argument("--max_ckpts_to_keep", type=int, default=3,
+                        help="Keep only the newest N step checkpoints (0 = keep all)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from", type=Path, default=None)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     train_sae(**{k: v for k, v in vars(args).items() if v is not None})
+
+
+if __name__ == "__main__":
+    main()
