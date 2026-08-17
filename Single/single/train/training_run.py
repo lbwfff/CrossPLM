@@ -1,4 +1,5 @@
 import shutil
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -27,11 +28,12 @@ class SAETrainingRun:
             "n_tokens_total": 0,
             "current_step": 0,
         }
+        self._resumed = False
 
     def compute_metrics(self, batch):
         with t.no_grad():
             x_hat, f = self.trainer.ae(batch, output_features=True)
-            recon_loss = t.linalg.norm(batch - x_hat, dim=-1).mean().item()
+            recon_loss = self.trainer.reconstruction_loss(batch, x_hat).item()
             sparsity_loss = f.norm(p=1, dim=-1).mean().item()
 
             l0 = (f > 0).float().sum(dim=-1).mean().item()
@@ -89,10 +91,13 @@ class SAETrainingRun:
         save_dir = Path(self.checkpoint_cfg.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        # Resume support: if we resumed from a checkpoint, start at the saved
-        # step instead of 0, and skip the optimizer/scheduler warm-up that was
-        # already applied. If no checkpoint was loaded, start from step 0.
-        start_step = self.training_state["current_step"]
+        # A fresh run starts at step 0. A checkpoint stores the last completed
+        # step, so resumed runs continue at the following step.
+        start_step = (
+            self.training_state["current_step"] + 1
+            if self._resumed
+            else 0
+        )
         if start_step >= steps:
             print(f"Already trained {start_step}/{steps} steps; nothing to do.")
             return
@@ -134,6 +139,10 @@ class SAETrainingRun:
                 self._prune_checkpoints(save_dir)
 
         t.save(trainer.ae.state_dict(), save_dir / "model.pt")
+        config = trainer.config
+        config_dict = config.__dict__ if hasattr(config, "__dict__") else {}
+        with open(save_dir / "training_config.json", "w") as f:
+            json.dump(config_dict, f, indent=2, default=str)
         print(f"\n{'='*50}")
         print("Training complete. Final metrics on last batch (per-batch view):")
         final = self.compute_metrics(batch)
@@ -194,6 +203,7 @@ class SAETrainingRun:
         state_path = checkpoint_dir / "training_state.pt"
         if state_path.exists():
             self.training_state.update(t.load(state_path, weights_only=True))
+            self._resumed = True
             print(f"Resumed from step {self.training_state['current_step']}")
         else:
             # Legacy checkpoint saved before training_state.pt existed; start from 0.

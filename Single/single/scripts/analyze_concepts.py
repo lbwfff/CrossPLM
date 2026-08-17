@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -42,6 +43,21 @@ from single.sae.inference import load_sae
 from single.analysis.feature_alignment import align_features_to_concepts
 
 
+def _discover_shard_ids(path: Path) -> List[int]:
+    ids = []
+    for child in Path(path).glob("shard_*"):
+        match = re.fullmatch(r"shard_(\d+)", child.name)
+        if match:
+            ids.append(int(match.group(1)))
+    ids = sorted(set(ids))
+    if not ids:
+        raise ValueError(f"No numeric shard directories found in {path}")
+    expected = list(range(ids[-1] + 1))
+    if ids != expected:
+        raise ValueError(f"Shard IDs in {path} are not contiguous: {ids}")
+    return ids
+
+
 def cmd_build(
     annotations_tsv: Path,
     concepts_dir: Optional[Path] = None,
@@ -49,9 +65,9 @@ def cmd_build(
     exp_dir: Optional[Path] = None,
     source: Optional[str] = None,
     n_shards: int = 5,
-    min_seq_len: int = 30,
-    max_seq_len: int = 1022,
-    max_residues: Optional[int] = None,
+    min_seq_len: int = 0,
+    max_seq_len: int = 10_000,
+    max_residues: Optional[int] = 510,
 ):
     from single.analysis.concepts import build_concept_matrix
     from single.paths import resolve_experiment
@@ -91,6 +107,69 @@ def _load_shard_pair(embeddings_dir: Path, concepts_dir: Path, shard_id: int, de
         shard_emb = shard_emb.get("embeddings", shard_emb)
     shard_embeddings = shard_emb.to(device)
 
+    embedding_residues = Path(embeddings_dir) / f"shard_{shard_id}" / "residues.csv"
+    concept_residues = Path(concepts_dir) / f"shard_{shard_id}" / "residues.csv"
+    if not embedding_residues.exists() or not concept_residues.exists():
+        raise ValueError(
+            f"Missing residue identity metadata for shard {shard_id}. "
+            "Re-extract embeddings and rebuild concepts; comparing only token "
+            "counts is unsafe."
+        )
+    emb_meta = pd.read_csv(embedding_residues, dtype=str)
+    con_meta = pd.read_csv(concept_residues, dtype=str)
+    embedding_config_path = Path(embeddings_dir) / "metadata.json"
+    concept_config_path = Path(concepts_dir) / "metadata.json"
+    if embedding_config_path.exists() and concept_config_path.exists():
+        emb_cfg = json.loads(embedding_config_path.read_text())
+        con_cfg = json.loads(concept_config_path.read_text())
+        config_pairs = {
+            "min_seq_len": (emb_cfg.get("min_seq_len"), con_cfg.get("min_seq_len")),
+            "max_seq_len": (emb_cfg.get("max_seq_len"), con_cfg.get("max_seq_len")),
+            "n_shards": (emb_cfg.get("n_shards"), con_cfg.get("n_shards")),
+            "shuffle_seed": (emb_cfg.get("shuffle_seed"), con_cfg.get("shuffle_seed")),
+            "max_residues": (
+                emb_cfg.get("residues_per_sequence"),
+                con_cfg.get("max_residues"),
+            ),
+        }
+        mismatches = {
+            key: values for key, values in config_pairs.items()
+            if values[0] is not None and values[1] is not None and values[0] != values[1]
+        }
+        if mismatches:
+            raise ValueError(
+                f"Embedding/concept preprocessing metadata differs for shard "
+                f"{shard_id}: {mismatches}"
+            )
+
+    identity_cols = ["sequence_hash", "amino_acid", "position"]
+    if "Entry" in emb_meta.columns and "Entry" in con_meta.columns:
+        identity_cols.insert(0, "Entry")
+    missing_emb = [c for c in identity_cols if c not in emb_meta.columns]
+    missing_con = [c for c in identity_cols if c not in con_meta.columns]
+    if missing_emb or missing_con:
+        raise ValueError(
+            f"Shard {shard_id} residue metadata lacks identity columns: "
+            f"embeddings={missing_emb}, concepts={missing_con}. Rebuild both artifacts."
+        )
+    if len(emb_meta) != len(con_meta):
+        raise ValueError(
+            f"Residue metadata row counts differ for shard {shard_id}: "
+            f"embeddings={len(emb_meta)}, concepts={len(con_meta)}"
+        )
+    emb_identity = emb_meta[identity_cols].reset_index(drop=True)
+    con_identity = con_meta[identity_cols].reset_index(drop=True)
+    for frame in (emb_identity, con_identity):
+        frame["amino_acid"] = frame["amino_acid"].str.upper()
+    if not emb_identity.equals(con_identity):
+        mismatch = (emb_identity != con_identity).any(axis=1)
+        first = int(np.flatnonzero(mismatch.to_numpy())[0])
+        raise ValueError(
+            f"Residue identity mismatch at shard {shard_id}, row {first}; "
+            "embedding and concept artifacts were not produced from the same "
+            "ordered proteins/residues."
+        )
+
     if concept_matrix.shape[0] != shard_embeddings.shape[0]:
         raise ValueError(
             f"Concept matrix ({concept_matrix.shape[0]} rows) and embeddings "
@@ -104,7 +183,78 @@ def _load_shard_pair(embeddings_dir: Path, concepts_dir: Path, shard_id: int, de
             f"  Re-extract embeddings from the SAME TSV used to build concepts."
         )
 
-    return concept_matrix, shard_embeddings
+    protein_key = "Entry" if "Entry" in metadata.columns else "sequence_hash"
+    protein_ids = pd.factorize(metadata[protein_key], sort=False)[0]
+    return concept_matrix, shard_embeddings, protein_ids
+
+
+def _load_combined_shards(
+    embeddings_dir: Path, concepts_dir: Path, shard_ids: List[int], device: str
+):
+    """Load validated shards as one pooled alignment dataset."""
+    from scipy import sparse
+
+    matrices = []
+    embeddings = []
+    domain_offset = 0
+    for shard_id in shard_ids:
+        matrix, shard_embeddings, protein_ids = _load_shard_pair(
+            embeddings_dir, concepts_dir, shard_id, "cpu"
+        )
+        # Domain instance IDs are generated independently inside each shard.
+        # Remap positive values before vstack so identical local IDs from two
+        # shards can never be mistaken for the same pooled domain.
+        matrix = matrix.copy()
+        positive_ids = np.unique(matrix.data[matrix.data > 0])
+        if positive_ids.size:
+            mapped = domain_offset + np.searchsorted(positive_ids, matrix.data) + 1
+            matrix.data = np.where(matrix.data > 0, mapped, 0).astype(np.int64)
+            domain_offset += int(positive_ids.size)
+        matrices.append(matrix)
+        embeddings.append(shard_embeddings)
+        if len(matrices) == 1:
+            pooled_protein_ids = protein_ids.astype(np.int64)
+        else:
+            pooled_protein_ids = np.concatenate(
+                [pooled_protein_ids, protein_ids + pooled_protein_ids.max() + 1]
+            )
+    if not matrices:
+        raise ValueError("No shards selected for pooled alignment")
+    return (
+        sparse.vstack(matrices, format="csr"),
+        torch.cat(embeddings, dim=0),
+        pooled_protein_ids,
+    )
+
+
+def _metrics_to_dataframe(metrics, shard_label):
+    rows = []
+    for fidx, concept_dict in metrics.items():
+        for concept, entry in concept_dict.items():
+            row = {
+                "feature": fidx,
+                "concept": concept,
+                "f1": entry["f1"],
+                "precision": entry["precision"],
+                "recall": entry["recall"],
+                "auroc": entry["auroc"],
+                "threshold": entry["threshold"],
+                "shard": shard_label,
+            }
+            for key in ("tp", "fp", "fn", "n_tokens", "n_positives"):
+                if key in entry:
+                    row[key] = entry[key]
+            if "f1_per_domain" in entry:
+                for key in (
+                    "domain_tp", "domain_fp", "domain_fn",
+                    "domain_precision", "domain_recall", "domain_f1",
+                ):
+                    row[key] = entry[key]
+                row["f1_per_domain"] = entry["f1_per_domain"]
+                row["recall_per_domain"] = entry["recall_per_domain"]
+                row["n_domains"] = entry["n_domains"]
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _align_shards(
@@ -120,12 +270,13 @@ def _align_shards(
     compute_domain_f1: bool,
     min_positives: int,
     threshold_percents: Optional[List[float]],
+    fixed_thresholds: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """Run alignment over a set of shards and return all pairs as a DataFrame."""
     all_pairs = []
     for shard_id in shard_ids:
         print(f"  Shard {shard_id}...")
-        concept_matrix, shard_embeddings = _load_shard_pair(
+        concept_matrix, shard_embeddings, protein_ids = _load_shard_pair(
             embeddings_dir, concepts_dir, shard_id, device
         )
         print(f"  Embeddings shard_{shard_id}: {shard_embeddings.shape}")
@@ -141,6 +292,8 @@ def _align_shards(
             compute_domain_f1=compute_domain_f1,
             min_positives=min_positives,
             threshold_percents=threshold_percents,
+            fixed_thresholds=fixed_thresholds,
+            protein_ids=protein_ids,
         )
 
         for fidx, concept_dict in metrics.items():
@@ -155,7 +308,15 @@ def _align_shards(
                     "threshold": entry["threshold"],
                     "shard": shard_id,
                 }
+                for key in ("tp", "fp", "fn", "n_tokens", "n_positives"):
+                    if key in entry:
+                        row[key] = entry[key]
                 if compute_domain_f1 and "f1_per_domain" in entry:
+                    for key in (
+                        "domain_tp", "domain_fp", "domain_fn",
+                        "domain_precision", "domain_recall", "domain_f1",
+                    ):
+                        row[key] = entry[key]
                     row["f1_per_domain"] = entry["f1_per_domain"]
                     row["recall_per_domain"] = entry["recall_per_domain"]
                     row["n_domains"] = entry["n_domains"]
@@ -228,13 +389,33 @@ def cmd_align(
         raise ValueError(f"No concept columns found in {concepts_dir}/concept_columns.txt")
 
     print("\nLoading embeddings...")
-    shards_to_process = [shard] if shard is not None else list(range(len(list(Path(concepts_dir).glob("shard_*")))))
+    shards_to_process = [shard] if shard is not None else _discover_shard_ids(concepts_dir)
 
-    df = _align_shards(
-        sae, embeddings_dir, concepts_dir, concept_names, shards_to_process,
-        device, feature_chunk_size, batch_size, compute_auroc, compute_domain_f1,
-        min_positives, threshold_percents,
-    )
+    if shard is None:
+        pooled_matrix, pooled_embeddings, pooled_protein_ids = _load_combined_shards(
+            embeddings_dir, concepts_dir, shards_to_process, device
+        )
+        pooled_metrics = align_features_to_concepts(
+            sae=sae,
+            embeddings=pooled_embeddings,
+            concept_matrix=pooled_matrix,
+            concept_names=concept_names,
+            feature_chunk_size=feature_chunk_size,
+            batch_size=batch_size,
+            compute_auroc=compute_auroc,
+            compute_domain_f1=compute_domain_f1,
+            min_positives=min_positives,
+            threshold_percents=threshold_percents,
+            protein_ids=pooled_protein_ids,
+            device=device,
+        )
+        df = _metrics_to_dataframe(pooled_metrics, "pooled")
+    else:
+        df = _align_shards(
+            sae, embeddings_dir, concepts_dir, concept_names, shards_to_process,
+            device, feature_chunk_size, batch_size, compute_auroc, compute_domain_f1,
+            min_positives, threshold_percents,
+        )
 
     # Save full metrics (latest shard's metrics dict for JSON)
     # Save summary CSV (all pairs, no threshold filtering)
@@ -306,7 +487,7 @@ def cmd_heldout(
         raise ValueError(f"No concept columns found in {concepts_dir}/concept_columns.txt")
 
     # Split shards into valid / test
-    all_shards = list(range(len(list(Path(concepts_dir).glob("shard_*")))))
+    all_shards = _discover_shard_ids(concepts_dir)
     if split_mode == "half":
         mid = len(all_shards) // 2
         valid_shards, test_shards = all_shards[:mid], all_shards[mid:]
@@ -319,22 +500,45 @@ def cmd_heldout(
     print(f"\nValid shards: {valid_shards}")
     print(f"Test shards:  {test_shards}")
 
-    # Run alignment on both splits
+    # Pool the validation split before threshold selection. Selecting a
+    # threshold independently per shard and then combining the counts would
+    # mix different classifiers and invalidate the pooled F1.
     print("\n--- Valid split alignment (selection) ---")
-    df_valid = _align_shards(
-        sae, embeddings_dir, concepts_dir, concept_names, valid_shards,
-        device, feature_chunk_size, batch_size, compute_auroc, compute_domain_f1,
-        min_positives, threshold_percents,
+    valid_matrix, valid_embeddings, valid_protein_ids = _load_combined_shards(
+        embeddings_dir, concepts_dir, valid_shards, device
     )
+    valid_metrics = align_features_to_concepts(
+        sae=sae,
+        embeddings=valid_embeddings,
+        concept_matrix=valid_matrix,
+        concept_names=concept_names,
+        feature_chunk_size=feature_chunk_size,
+        batch_size=batch_size,
+        compute_auroc=compute_auroc,
+        compute_domain_f1=compute_domain_f1,
+        min_positives=min_positives,
+        threshold_percents=threshold_percents,
+        protein_ids=valid_protein_ids,
+        device=device,
+    )
+    df_valid = _metrics_to_dataframe(valid_metrics, "validation_pooled")
     valid_csv = output_dir / "heldout_valid_pairs.csv"
     df_valid.to_csv(valid_csv, index=False)
     print(f"  Valid split pairs saved to {valid_csv}")
+
+    # Freeze the validation-selected threshold for every test shard.
+    fixed_thresholds = np.full(
+        (sae.dict_size, len(concept_names)), np.nan, dtype=np.float32
+    )
+    concept_indices = {name: i for i, name in enumerate(concept_names)}
+    for row in df_valid.itertuples(index=False):
+        fixed_thresholds[int(row.feature), concept_indices[row.concept]] = row.threshold
 
     print("\n--- Test split alignment (evaluation) ---")
     df_test = _align_shards(
         sae, embeddings_dir, concepts_dir, concept_names, test_shards,
         device, feature_chunk_size, batch_size, compute_auroc, compute_domain_f1,
-        min_positives, threshold_percents,
+        0, threshold_percents, fixed_thresholds=fixed_thresholds,
     )
     test_csv = output_dir / "heldout_test_pairs.csv"
     df_test.to_csv(test_csv, index=False)
@@ -364,9 +568,9 @@ def main(argv=None):
     p_build.add_argument("--concepts_dir", type=Path, default=None,
                          help="Explicit concepts dir (overrides experiment routing)")
     p_build.add_argument("--n_shards", type=int, default=5)
-    p_build.add_argument("--min_seq_len", type=int, default=30)
-    p_build.add_argument("--max_seq_len", type=int, default=1022)
-    p_build.add_argument("--max_residues", type=int, default=None,
+    p_build.add_argument("--min_seq_len", type=int, default=0)
+    p_build.add_argument("--max_seq_len", type=int, default=10000)
+    p_build.add_argument("--max_residues", type=int, default=510,
                          help="Residues kept per protein (must equal embedder "
                               "max_length - 2, e.g. 510 for max_length=512) so "
                               "concept rows align with embedding tokens")

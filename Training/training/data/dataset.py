@@ -48,15 +48,45 @@ class TokenClassificationDataset(Dataset):
         tokenizer: PreTrainedTokenizer,
         max_length: int = 512,
         label_map: Optional[Dict[str, int]] = None,
+        ignore_chars: Optional[set] = None,
     ):
         self.sequences = sequences
         self.labels = labels
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.label_map = label_map or build_label_map(labels)
+        self.ignore_chars = set(ignore_chars) if ignore_chars is not None else {IGNORE_CHAR}
         # Number of DISTINCT classes (many chars may map to one class), NOT the
         # number of characters in the map.
         self.num_labels = label_map_n_classes(self.label_map)
+
+        if getattr(self.tokenizer, "padding_side", "right") != "right":
+            raise ValueError("Token classification requires tokenizer.padding_side='right'")
+        # Validate every sample. The number of special tokens is obtained from
+        # the tokenizer output instead of assuming exactly BOS/EOS.
+        for sample_idx, (seq, label_str) in enumerate(zip(self.sequences, self.labels)):
+            if len(seq) != len(label_str):
+                raise ValueError(
+                    f"Sequence/label length mismatch at sample {sample_idx}: "
+                    f"{len(seq)} != {len(label_str)}"
+                )
+            enc = self.tokenizer(
+                seq, truncation=True, max_length=self.max_length,
+                return_special_tokens_mask=True,
+            )
+            special_mask = enc.get("special_tokens_mask")
+            if special_mask is None:
+                special_ids = set(self.tokenizer.all_special_ids)
+                special_mask = [int(token_id in special_ids) for token_id in enc["input_ids"]]
+            non_special = len(enc["input_ids"]) - sum(special_mask)
+            n_special = sum(special_mask)
+            expected = min(len(seq), max(self.max_length - n_special, 0))
+            if non_special != expected:
+                raise ValueError(
+                    f"Tokenizer alignment check failed at sample {sample_idx}: "
+                    f"expected {expected} residue tokens but got {non_special}. "
+                    "This pipeline requires one token per residue."
+                )
 
     def __len__(self):
         return len(self.sequences)
@@ -96,7 +126,7 @@ class TokenClassificationDataset(Dataset):
                     ch = label_str[seq_idx]
                     # Unknown characters (e.g. a residue not seen in training)
                     # are ignored, consistent with Single's encode_label_string.
-                    if ch == IGNORE_CHAR or ch not in self.label_map:
+                    if ch in self.ignore_chars or ch not in self.label_map:
                         label_ids.append(-100)
                     else:
                         label_ids.append(self.label_map[ch])
@@ -119,7 +149,12 @@ def compute_class_weights(
                 continue
             counts[label_map[ch]] += 1
 
+    return _class_weights_from_counts(counts, method)
+
+
+def _class_weights_from_counts(counts: List[int], method: str) -> torch.Tensor:
     import math
+    n_classes = len(counts)
     total = sum(counts)
 
     if method == "none":
@@ -139,6 +174,23 @@ def compute_class_weights(
     print(f"  Class counts: {counts}")
     print(f"  Class weights ({method}): {[round(w, 4) for w in weights]}")
     return torch.tensor(weights, dtype=torch.float)
+
+
+def compute_class_weights_from_dataset(
+    dataset: Dataset,
+    label_map: Dict[str, int],
+    method: str = "inverse",
+) -> torch.Tensor:
+    """Compute weights from the actual tokenized/truncated dataset labels."""
+    n_classes = label_map_n_classes(label_map)
+    counts = [0] * n_classes
+    for index in range(len(dataset)):
+        label_ids = dataset[index]["labels"]
+        for class_id in label_ids[label_ids >= 0].tolist():
+            counts[int(class_id)] += 1
+    if sum(counts) == 0:
+        raise ValueError("No valid training labels remain after tokenization/truncation")
+    return _class_weights_from_counts(counts, method)
 
 
 def load_data_from_csv(

@@ -1,4 +1,6 @@
 from abc import ABC, abstractmethod
+from dataclasses import asdict, is_dataclass
+import json
 from pathlib import Path
 
 import torch as t
@@ -30,6 +32,9 @@ class SAETrainer(ABC):
             "scheduler": self.scheduler.state_dict() if hasattr(self, "scheduler") else None,
         }
         t.save(optimizer_state, save_dir / "optimizer.pt")
+        config = asdict(self.config) if is_dataclass(self.config) else vars(self.config)
+        with open(save_dir / "training_config.json", "w") as f:
+            json.dump(config, f, indent=2, default=str)
 
     def update_from_checkpoint(self, checkpoint_dir: Path):
         self.ae.load_state_dict(t.load(checkpoint_dir / "checkpoint.pt"))

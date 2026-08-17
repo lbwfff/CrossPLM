@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -33,7 +34,12 @@ import torch
 
 from single.sae.inference import load_sae
 from single.analysis.sequence import build_residue_positions
-from single.analysis.co_activation import compute_coactivation, interpret
+from single.analysis.co_activation import (
+    aggregate_coactivation_results,
+    compute_coactivation,
+    interpret,
+)
+from single.data import load_residue_mapping_from_metadata
 
 
 def analyze(
@@ -48,7 +54,7 @@ def analyze(
     sequence_column: str = "sequence",
     label_map: Optional[str] = None,
     layer: int = 6,
-    shard: int = 0,
+    shard: Optional[int] = None,
     n_shards: int = 5,
     max_length: int = 512,
     neighborhood: int = 5,
@@ -91,40 +97,71 @@ def analyze(
     sae = load_sae(sae_dir, device=device)
     print(f"  {sae.__class__.__name__}: {sae.dict_size} features, {sae.activation_dim}D")
     for f in (feature_a, feature_b):
-        if f >= sae.dict_size:
+        if f < 0 or f >= sae.dict_size:
             raise ValueError(f"feature index {f} out of range [0, {sae.dict_size})")
 
-    emb_path = Path(embeddings_dir) / f"shard_{shard}" / "embeddings.pt"
-    if not emb_path.exists():
-        cands = sorted(Path(embeddings_dir).glob(f"shard_{shard}/**/embeddings.pt"))
-        if not cands:
-            raise FileNotFoundError(f"No embeddings for shard {shard} in {embeddings_dir}")
-        emb_path = cands[0]
-    data = torch.load(emb_path, map_location="cpu", weights_only=True)
-    embeddings = data["embeddings"] if isinstance(data, dict) else data
-    embeddings = embeddings.to(device)
-    print(f"\nEmbeddings shard_{shard}: {embeddings.shape}")
+    if shard is None:
+        shard_ids = []
+        for path in Path(embeddings_dir).glob("shard_*"):
+            match = re.fullmatch(r"shard_(\d+)", path.name)
+            if match:
+                shard_ids.append(int(match.group(1)))
+        shard_ids = sorted(set(shard_ids))
+        if not shard_ids:
+            raise ValueError(f"No numeric shard directories found in {embeddings_dir}")
+        if shard_ids != list(range(shard_ids[-1] + 1)):
+            raise ValueError(f"Shard IDs are not contiguous: {shard_ids}")
+    else:
+        if shard < 0:
+            raise ValueError("shard must be non-negative")
+        shard_ids = [shard]
 
-    # Rebuild token -> (protein, residue) mapping
+    # Rebuild token -> (protein, residue) mappings for all selected shards.
     print(f"\nRebuilding protein/residue mapping from {sequences_csv}...")
-    df, shard_proteins, shard_respos = build_residue_positions(
-        sequences_csv, [shard], n_shards=n_shards, max_residues=max_residues,
+    shards, shard_proteins, shard_respos = build_residue_positions(
+        sequences_csv, shard_ids, n_shards=n_shards, max_residues=max_residues,
         sequence_column=sequence_column,
         min_seq_len=min_seq_len, max_seq_len=max_seq_len,
         max_sequences=max_sequences,
     )
-    protein_ids = np.array(shard_proteins[shard], dtype=np.int64)
-    respos = shard_respos[shard]
-
-    print(f"\nComputing co-activation of feature #{feature_a} and #{feature_b}...")
-    result = compute_coactivation(
-        sae=sae, embeddings=embeddings,
-        protein_ids=protein_ids, respos=respos,
-        feature_a=feature_a, feature_b=feature_b,
-        neighborhood=neighborhood,
-        activation_threshold=activation_threshold,
-        device=device,
-    )
+    shard_results = []
+    for sid in shard_ids:
+        emb_path = Path(embeddings_dir) / f"shard_{sid}" / "embeddings.pt"
+        if not emb_path.exists():
+            cands = sorted(Path(embeddings_dir).glob(f"shard_{sid}/**/embeddings.pt"))
+            if not cands:
+                raise FileNotFoundError(f"No embeddings for shard {sid} in {embeddings_dir}")
+            emb_path = cands[0]
+        data = torch.load(emb_path, map_location="cpu", weights_only=True)
+        embeddings = data["embeddings"] if isinstance(data, dict) else data
+        embeddings = embeddings.to(device)
+        metadata_path = Path(embeddings_dir) / f"shard_{sid}" / "residues.csv"
+        if metadata_path.exists():
+            mapped_ids, mapped_positions = load_residue_mapping_from_metadata(
+                metadata_path, shards[sid], sequence_column
+            )
+            protein_ids = np.asarray(mapped_ids, dtype=np.int64)
+            respos = mapped_positions
+        else:
+            protein_ids = np.array(shard_proteins[sid], dtype=np.int64)
+            respos = shard_respos[sid]
+        if len(protein_ids) != embeddings.shape[0]:
+            raise ValueError(
+                f"Embedding/mapping token count mismatch for shard {sid}: "
+                f"embeddings={embeddings.shape[0]}, mapping={len(protein_ids)}"
+            )
+        print(f"\nComputing shard_{sid} co-activation: {embeddings.shape}")
+        shard_results.append(compute_coactivation(
+            sae=sae, embeddings=embeddings,
+            protein_ids=protein_ids, respos=respos,
+            feature_a=feature_a, feature_b=feature_b,
+            neighborhood=neighborhood,
+            activation_threshold=activation_threshold,
+            device=device,
+        ))
+    result = aggregate_coactivation_results(shard_results)
+    result["shard"] = shard
+    result["shards"] = shard_ids
 
     # Report
     print("\n" + "=" * 60)
@@ -141,16 +178,22 @@ def analyze(
     print(f"    P(A | B) = {result['overlap_ba']*100:.2f}%   (baseline {result['baseline_a']*100:.2f}%)"
           f"  enrich={result['enrich_ba']:.2f}x")
     print(f"  Neighborhood (±{neighborhood} residues):")
-    print(f"    P(B within ±k | A) = {result['neighbor_ab']*100:.2f}%"
+    print(f"    P(B nearby, excluding same residue | A) = {result['neighbor_ab']*100:.2f}%"
+          f"  (independence null {result['neighbor_ab_null']*100:.2f}%)"
           f"  enrich={result['neighbor_enrich_ab']:.2f}x")
-    print(f"    P(A within ±k | B) = {result['neighbor_ba']*100:.2f}%"
+    print(f"    P(A nearby, excluding same residue | B) = {result['neighbor_ba']*100:.2f}%"
+          f"  (independence null {result['neighbor_ba_null']*100:.2f}%)"
           f"  enrich={result['neighbor_enrich_ba']:.2f}x")
     print("=" * 60)
     print("Interpretation:")
     print(interpret(result))
     print("=" * 60)
 
-    out_path = output_dir / f"coactivation_{feature_a}_{feature_b}_shard{shard}.json"
+    out_name = (
+        f"coactivation_{feature_a}_{feature_b}.json"
+        if shard is None else f"coactivation_{feature_a}_{feature_b}_shard{shard}.json"
+    )
+    out_path = output_dir / out_name
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2, default=str)
     print(f"\nSaved to {out_path}")
@@ -174,7 +217,8 @@ def main(argv=None):
     parser.add_argument("--exp_dir", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--layer", type=int, default=6)
-    parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--shard", type=int, default=None,
+                        help="Analyze one shard for a quick test; default aggregates all shards")
     parser.add_argument("--n_shards", type=int, default=5)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--neighborhood", type=int, default=5,

@@ -44,3 +44,6 @@ Single/single/**/__pycache__/
 
 # All SAE outputs (embeddings, models, analysis results)
 Outputs/
+
+# Local code-review notes
+CURRENT_CODE_REVIEW.md

@@ -12,6 +12,7 @@ Usage:
 
 import os
 import sys
+import re
 
 # Allow running directly from the repository root, e.g.
 #   python Single/single/scripts/analyze_sequence.py ...
@@ -34,7 +35,7 @@ from single.sae.inference import load_sae, get_sae_feats_in_batches, normalize_s
 from single.analysis.feature_alignment import (
     align_features_to_labels,
     find_top_features_for_class,
-    compute_feature_label_correlation,
+    compute_feature_label_correlation_stats,
     compute_feature_activation_profile,
 )
 
@@ -102,28 +103,39 @@ def analyze_features(
     labels = None
 
     if data_path.is_file():
-        data = torch.load(data_path, map_location=device, weights_only=True)
+        data = torch.load(data_path, map_location="cpu", weights_only=True)
         if isinstance(data, dict):
-            embeddings = data["embeddings"].to(device)
+            embeddings = data["embeddings"].float()
             labels = data.get("labels")
             if labels is not None:
-                labels = labels.to(device)
+                labels = labels.cpu()
         else:
-            embeddings = data.to(device)
+            embeddings = data.float()
     else:
-        pt_files = sorted(data_path.glob("**/embeddings.pt"))
+        pt_files = list(data_path.glob("**/embeddings.pt"))
+        pt_files.sort(key=lambda p: int(re.search(r"shard_(\d+)", str(p)).group(1))
+                      if re.search(r"shard_(\d+)", str(p)) else str(p))
         all_embeddings, all_labels = [], []
+        label_presence = []
         for f in pt_files:
             d = torch.load(f, map_location="cpu", weights_only=True)
             if isinstance(d, dict):
                 lbl = d.get("labels")
+                label_presence.append(lbl is not None)
                 if lbl is not None:
                     all_labels.append(lbl)
                 d = d.get("embeddings", d)
+            else:
+                label_presence.append(False)
             all_embeddings.append(d.float())
-        embeddings = torch.cat(all_embeddings, dim=0).to(device)
+        embeddings = torch.cat(all_embeddings, dim=0)
+        if any(label_presence) and not all(label_presence):
+            raise ValueError(
+                "Embedding shards have inconsistent label presence; either all "
+                "shards must contain labels or none may contain labels."
+            )
         if all_labels:
-            labels = torch.cat(all_labels, dim=0).to(device)
+            labels = torch.cat(all_labels, dim=0)
             print(f"   Labels loaded from {len(pt_files)} shard files (already aligned)")
 
     print(f"   Embeddings shape: {embeddings.shape}")
@@ -180,21 +192,22 @@ def analyze_features(
                                       df[label_column]):
                 all_labels.extend(_encode_truncated(seq, label_str))
 
-        labels = torch.tensor(all_labels, device=device)
+        labels = torch.tensor(all_labels)
 
     if labels is not None and labels.shape[0] != embeddings.shape[0]:
-        min_len = min(labels.shape[0], embeddings.shape[0])
-        print(f"\n⚠️  WARNING: labels ({labels.shape[0]}) ≠ embeddings ({embeddings.shape[0]}) tokens")
-        print(f"   Truncating both to {min_len} tokens...")
-        labels = labels[:min_len]
-        embeddings = embeddings[:min_len]
+        raise ValueError(
+            f"Labels ({labels.shape[0]}) and embeddings ({embeddings.shape[0]}) "
+            "tokens do not align; refusing to truncate both silently."
+        )
     print(f"   Labels shape: {labels.shape if labels is not None else 'N/A'}")
 
     # 4. Feature-label alignment
     if labels is not None:
+        analysis_feature_cache = {}
         print("\n4. Aligning features to task labels...")
         metrics = align_features_to_labels(
-            sae, embeddings, labels, positive_class=positive_class,
+            sae, embeddings, labels, positive_class=positive_class, device=device,
+            feature_cache=analysis_feature_cache,
         )
 
         top_pos = find_top_features_for_class(
@@ -215,16 +228,32 @@ def analyze_features(
 
         # Correlation analysis
         print("\n5. Computing feature-label correlations...")
-        correlations = compute_feature_label_correlation(
-            sae, embeddings, labels, positive_class=positive_class,
+        correlation_stats = compute_feature_label_correlation_stats(
+            sae, embeddings, labels, positive_class=positive_class, device=device,
+            feature_cache=analysis_feature_cache,
         )
+        correlations = correlation_stats["correlation"]
 
         top_corr = np.argsort(np.abs(correlations))[::-1][:20]
         print("   Top features by |correlation| with label:")
         for fidx in top_corr:
-            print(f"     Feature #{fidx}: r={correlations[fidx]:.4f}")
+            print(
+                f"     Feature #{fidx}: r={correlations[fidx]:.4f} "
+                f"p={correlation_stats['p_value'][fidx]:.3g} "
+                f"q={correlation_stats['q_value'][fidx]:.3g}"
+            )
 
         np.save(output_dir / "feature_label_correlations.npy", correlations)
+        with open(output_dir / "feature_label_correlation_stats.json", "w") as f:
+            json.dump(
+                {
+                    key: value.tolist()
+                    for key, value in correlation_stats.items()
+                },
+                f,
+                indent=2,
+            )
+        print(f"   Correlation p-values/FDR saved to {output_dir / 'feature_label_correlation_stats.json'}")
 
         # Activation profile (multi-class aware when label_map has >2 classes)
         n_classes = len(set(label_map_spec.get("mapping", {}).values())) if label_map_spec else 2
@@ -237,6 +266,8 @@ def analyze_features(
             positive_class=positive_class,
             pos_name=pos_name, neg_name=neg_name,
             label_map_spec=label_map_spec,
+            device=device,
+            feature_cache=analysis_feature_cache,
         )
 
         gap = profile["activation_gap"]
@@ -254,6 +285,7 @@ def analyze_features(
     max_per_feat = torch.zeros(n_features, device=device)
 
     from single.sae.inference import split_up_feature_list
+    feature_cache = analysis_feature_cache if labels is not None else {}
     for feat_list in tqdm(
         split_up_feature_list(n_features, 200),
         desc="Computing max activations",
@@ -261,7 +293,7 @@ def analyze_features(
         feats = get_sae_feats_in_batches(
             sae=sae, aa_embds=embeddings,
             chunk_size=4096, feat_list=feat_list,
-            normalize_features=False, device=str(device),
+            normalize_features=False, device=str(device), cache=feature_cache,
         )
         max_per_feat[feat_list] = torch.max(
             max_per_feat[feat_list], feats.max(dim=0)[0]

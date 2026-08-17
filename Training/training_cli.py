@@ -81,7 +81,7 @@ def cmd_train(args):
     from training import (
         TrainingConfig, TokenClassificationDataset, load_data_from_csv,
         split_dataset, build_label_map, build_id2label, label_map_n_classes,
-        compute_class_weights, PLMModel, Trainer,
+        compute_class_weights_from_dataset, PLMModel, Trainer,
     )
 
     def set_seed(seed: int):
@@ -92,6 +92,12 @@ def cmd_train(args):
             torch.cuda.manual_seed_all(seed)
 
     config = TrainingConfig.from_yaml(args.config)
+    if config.task_type != "token_classification":
+        raise ValueError(
+            f"task_type '{config.task_type}' is not supported — only "
+            f"'token_classification' is implemented. (mlm uses a different model "
+            f"head and training objective than what the trainer provides.)"
+        )
     set_seed(config.seed)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -121,6 +127,7 @@ def cmd_train(args):
         print(f"  Label map (from '{config.label_map}'): {label_map}")
     else:
         seq_col, lbl_col = config.sequence_column, config.label_column
+    ignore_chars = set(spec.get("ignore", "_")) if spec else {"_"}
 
     print(f"[Loading CSV] {csv_path}")
     sequences, labels = load_data_from_csv(
@@ -137,6 +144,16 @@ def cmd_train(args):
         label_map = build_label_map(labels)
         print(f"  Label map (inferred from CSV): {label_map}")
 
+    # Guard: at least some residues must map to valid classes.
+    # All-ignored labels → loss=0 → garbage training with no signal.
+    valid = sum(1 for lbl in labels for ch in lbl if ch in label_map)
+    if valid == 0:
+        raise ValueError(
+            f"No valid residues after applying the label map — every character "
+            f"in the label column was ignored. Check label_map, sequence_column, "
+            f"and label_column (loaded {len(sequences)} rows from {csv_path})."
+        )
+
     print(f"[Loading backbone model] {config.backbone_model_id}")
     n_classes = label_map_n_classes(label_map)
     plm = PLMModel(
@@ -151,8 +168,8 @@ def cmd_train(args):
     # build_id2label dedupes by class id (many-to-one char maps like mBMRB).
     plm.config.id2label = build_id2label(label_map)
     plm.config.label2id = {c: i for c, i in label_map.items()}
-
-    class_weights = compute_class_weights(labels, label_map, config.class_weight_method)
+    plm.config.crossplm_ignore_chars = sorted(ignore_chars)
+    plm.config.crossplm_positive_class = int(spec.get("positive_class", 1)) if spec else 1
 
     print(f"[Building dataset...]")
     full_dataset = TokenClassificationDataset(
@@ -161,11 +178,19 @@ def cmd_train(args):
         tokenizer=plm.tokenizer,
         max_length=config.max_seq_length,
         label_map=label_map,
+        ignore_chars=ignore_chars,
     )
     print(f"  Model params: {plm.get_num_params():,}")
 
     train_dataset, eval_dataset = split_dataset(full_dataset, config.train_ratio, config.seed)
     print(f"  Train: {len(train_dataset)}  Eval: {len(eval_dataset)}")
+
+    # Compute class weights only from the training split and from the labels
+    # that survive tokenizer truncation/special-token masking. This avoids eval
+    # distribution leakage and keeps weights consistent with the loss data.
+    class_weights = compute_class_weights_from_dataset(
+        train_dataset, label_map, config.class_weight_method
+    )
 
     print("[Training...]")
     trainer = Trainer(
@@ -209,6 +234,8 @@ def cmd_eval(args):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or "<pad>"
+    if getattr(tokenizer, "padding_side", "right") != "right":
+        raise ValueError("Token classification evaluation requires right padding")
 
     print(f"[Loading CSV] {csv_path}")
     seq_col = args.sequence_column
@@ -218,9 +245,11 @@ def cmd_eval(args):
     # the CSV columns. Otherwise use the training-time map persisted in the
     # checkpoint, falling back to the eval CSV only for legacy checkpoints.
     label_map = None
+    ignore_chars = {"_"}
     if args.label_map:
         spec = _load_label_map(args.label_map)
         label_map = dict(spec["mapping"])
+        ignore_chars = set(spec.get("ignore", "_"))
         seq_col = spec.get("sequence_column") or seq_col
         lbl_col = spec.get("label_column") or lbl_col
         print(f"  Label map (from '{args.label_map}'): {label_map}")
@@ -238,6 +267,7 @@ def cmd_eval(args):
             with open(sidecar) as f:
                 lm = json.load(f)
             label_map = {str(k): int(v) for k, v in lm.get("label2id", {}).items()}
+            ignore_chars = set(lm.get("ignore", "_"))
             print(f"  Label map (from checkpoint label_map.json): {label_map}")
         else:
             # label2id is the complete {char: class_id} map persisted at training time
@@ -259,9 +289,19 @@ def cmd_eval(args):
                 print(f"  Label map (rebuilt from eval CSV): {label_map}")
 
     n_classes = label_map_n_classes(label_map)
+    # Guard: at least some residues must map to valid classes.
+    valid = sum(1 for lbl in labels for ch in lbl if ch in label_map)
+    if valid == 0:
+        raise ValueError(
+            f"No valid residues after applying the label map — every character "
+            f"in the label column was ignored. Check label_map, sequence_column, "
+            f"and label_column (loaded {len(sequences)} rows from {csv_path})."
+        )
+
     dataset = TokenClassificationDataset(
         sequences=sequences, labels=labels, tokenizer=tokenizer,
         max_length=args.max_seq_length, label_map=label_map,
+        ignore_chars=ignore_chars,
     )
 
     def collate_fn(batch):
@@ -283,12 +323,29 @@ def cmd_eval(args):
 
     print("[Evaluating...]")
     all_preds, all_labels, all_probs = [], [], []
+    model_n_labels = None
     with torch.no_grad():
         for batch in tqdm(loader):
             batch = {k: v.to(device) for k, v in batch.items()}
             logits = model(**batch).logits
+            # Custom FastPLMs configs may omit num_labels or expose a default
+            # value unrelated to the classifier head. The logits dimension is
+            # the authoritative output size for this checkpoint.
+            output_n_labels = int(logits.size(-1))
+            if model_n_labels is None:
+                model_n_labels = output_n_labels
+                if model_n_labels != n_classes:
+                    raise ValueError(
+                        f"Model produces {model_n_labels} output classes but "
+                        f"the label map defines {n_classes} classes. Use "
+                        f"the same label map that was used to train the checkpoint."
+                    )
+            elif output_n_labels != model_n_labels:
+                raise ValueError(
+                    f"Model output size changed during evaluation: first batch "
+                    f"had {model_n_labels}, current batch has {output_n_labels}."
+                )
             probs = torch.softmax(logits, dim=-1)
-            n_classes = probs.size(-1)
             for i in range(logits.size(0)):
                 mask = batch["labels"][i] != -100
                 all_preds.extend(logits[i][mask].argmax(dim=-1).cpu().tolist())
@@ -297,7 +354,8 @@ def cmd_eval(args):
 
     from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 
-    # n_classes is computed above from label_map_n_classes(label_map).
+    # n_classes is from label_map_n_classes(label_map), validated against the
+    # actual logits dimension above rather than a possibly incomplete config.
     accuracy = accuracy_score(all_labels, all_preds)
     f1 = f1_score(all_labels, all_preds, average="macro", labels=list(range(n_classes)), zero_division=0)
     cm = confusion_matrix(all_labels, all_preds, labels=list(range(n_classes)))

@@ -118,6 +118,7 @@ def find_max_activating_proteins(
     tracker = PerProteinActivationTracker(
         total_features, n_top=n_top, activation_threshold=activation_threshold
     )
+    feature_cache = {}
 
     for feature_list in tqdm(
         split_up_feature_list(total_features, feature_chunk_size),
@@ -130,6 +131,7 @@ def find_max_activating_proteins(
             feat_list=feature_list,
             normalize_features=True,
             device=str(device),
+            cache=feature_cache,
         )
         feats_np = feats.cpu().numpy()
 

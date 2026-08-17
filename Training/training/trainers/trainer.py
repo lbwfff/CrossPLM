@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import shutil
 import contextlib
 import torch
@@ -34,7 +35,7 @@ class Trainer:
         # contribute 0 instead of being excluded). Falls back to class_weights
         # length, then to observed classes.
         self.n_classes = n_classes if n_classes is not None else (len(class_weights) if class_weights is not None else None)
-        self.top_k = 3
+        self.top_k = max(1, int(getattr(config, "save_total_limit", 3)))
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.model.to(self.device)
@@ -75,6 +76,7 @@ class Trainer:
         self.global_step = 0
         self.epoch = 0
         self.best_f1 = 0.0
+        self.has_best_checkpoint = False
         self.best_checkpoints = []
         self.eval_history = []
 
@@ -142,6 +144,7 @@ class Trainer:
 
         self.model.model.zero_grad()
         train_loss = 0.0
+        accum_count = 0  # actual batches accumulated since last optimizer step
         epochs_to_run = num_epochs if int(self.config.max_steps) <= 0 else 9999
 
         loss_fct = None
@@ -176,8 +179,17 @@ class Trainer:
                     loss.backward()
                 train_loss += loss.item()
                 epoch_loss += loss.item()
+                accum_count += 1
 
                 if ((step + 1) % grad_accum == 0) or (step == len(train_loader) - 1):
+                    # For the tail batch: accumulated fewer steps than grad_accum.
+                    # Rescale accumulated gradients so the effective step size
+                    # reflects the actual number of accumulated batches.
+                    if accum_count < grad_accum:
+                        scale = grad_accum / accum_count
+                        for p in self.model.model.parameters():
+                            if p.grad is not None:
+                                p.grad.mul_(scale)
                     if self.scaler is not None:
                         self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -190,6 +202,7 @@ class Trainer:
                         self.optimizer.step()
                     lr_scheduler.step()
                     self.optimizer.zero_grad()
+                    accum_count = 0
                     self.global_step += 1
                     current_epoch = self.global_step / num_update_steps_per_epoch
 
@@ -214,6 +227,13 @@ class Trainer:
                         f1 = eval_metrics.get("f1", 0.0)
                         self._update_best_checkpoints(f1, self.global_step, current_epoch)
 
+                    save_steps = int(self.config.save_steps)
+                    if save_steps > 0 and self.global_step % save_steps == 0:
+                        self._save_checkpoint(
+                            f"step_{self.global_step}", self.best_f1, current_epoch
+                        )
+                        self._prune_step_checkpoints()
+
                     if int(self.config.max_steps) > 0 and self.global_step >= int(self.config.max_steps):
                         break
 
@@ -221,6 +241,10 @@ class Trainer:
                 break
 
         self._save_checkpoint("final", self.best_f1, self.epoch)
+        if not self.has_best_checkpoint:
+            # There may be valid evaluations whose macro-F1 is exactly zero.
+            # Still provide the stable downstream alias in that case.
+            self._save_checkpoint("best", self.best_f1, self.epoch)
         self._plot_training_curve()
 
     def evaluate(self):
@@ -293,8 +317,9 @@ class Trainer:
         tag = f"epoch_{epoch:.2f}_f1_{int(f1 * 10000):04d}"
         self._save_checkpoint(tag, f1, epoch)
 
-        if f1 > self.best_f1:
+        if not self.has_best_checkpoint or f1 > self.best_f1:
             self.best_f1 = f1
+            self.has_best_checkpoint = True
             # Stable alias pointing at the best-by-F1 checkpoint, so downstream
             # steps (eval, Single analysis) can always use `checkpoints/best`.
             self._save_checkpoint("best", f1, epoch)
@@ -317,6 +342,25 @@ class Trainer:
                         if os.path.isdir(path):
                             shutil.rmtree(path)
 
+    def _prune_step_checkpoints(self):
+        """Keep the newest periodic checkpoints according to save_total_limit."""
+        if self.task_dir is None:
+            return
+        limit = int(getattr(self.config, "save_total_limit", 3))
+        if limit <= 0:
+            return
+        root = os.path.join(self.task_dir, "checkpoints")
+        step_dirs = []
+        if not os.path.isdir(root):
+            return
+        for name in os.listdir(root):
+            match = re.fullmatch(r"step_(\d+)", name)
+            if match:
+                step_dirs.append((int(match.group(1)), name))
+        step_dirs.sort(reverse=True)
+        for _, name in step_dirs[limit:]:
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
     def _save_checkpoint(self, tag: str, f1: float, epoch: float):
         if self.task_dir is None:
             return
@@ -335,6 +379,8 @@ class Trainer:
                 json.dump({
                     "label2id": {str(k): int(v) for k, v in label2id.items()},
                     "id2label": getattr(self.model.config, "id2label", None),
+                    "ignore": list(getattr(self.model.config, "crossplm_ignore_chars", ["_"])),
+                    "positive_class": int(getattr(self.model.config, "crossplm_positive_class", 1)),
                 }, f, indent=2)
 
         training_state = {

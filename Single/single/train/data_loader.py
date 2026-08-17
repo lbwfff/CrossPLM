@@ -1,4 +1,5 @@
 import re
+from bisect import bisect_right
 from pathlib import Path
 from typing import Optional
 
@@ -69,14 +70,34 @@ class ActivationDataset(Dataset):
         self._load_one(self.data_path)
 
     def _load_sharded(self):
-        subdirs = sorted([d for d in self.data_path.iterdir() if d.is_dir()])
+        subdirs = [
+            d for d in self.data_path.iterdir()
+            if d.is_dir() and re.fullmatch(r"shard_\d+", d.name)
+        ]
+        subdirs.sort(key=lambda d: int(d.name.split("_")[1]))
         if not subdirs:
-            pt_files = sorted(self.data_path.glob("*.pt"))
+            pt_files = list(self.data_path.glob("*.pt"))
+            pt_files.sort(key=lambda p: int(re.search(r"shard_(\d+)", p.stem).group(1))
+                          if re.search(r"shard_(\d+)", p.stem) else p.name)
             if not pt_files:
                 raise FileNotFoundError(f"No shard data found in {self.data_path}")
+            if self.shard is not None:
+                selected = []
+                for path in pt_files:
+                    match = re.search(r"(?:^|/)shard_(\d+)(?:\.pt)?$", str(path))
+                    if match and int(match.group(1)) == self.shard:
+                        selected.append(path)
+                if not selected:
+                    raise FileNotFoundError(
+                        f"No flat .pt file for shard {self.shard} found in {self.data_path}"
+                    )
+                pt_files = selected
             for f in pt_files:
                 self._load_one(f)
         else:
+            shard_ids = [int(d.name.split("_")[1]) for d in subdirs]
+            if self.shard is None and shard_ids != list(range(shard_ids[-1] + 1)):
+                raise ValueError(f"Shard directories are not contiguous: {shard_ids}")
             for subdir in subdirs:
                 # If a specific shard was requested, skip all others.
                 if self.shard is not None:
@@ -91,13 +112,10 @@ class ActivationDataset(Dataset):
         return self.total_tokens
 
     def __getitem__(self, idx):
-        # Resolve the (shard, within-shard) index lazily. Shard count is small,
-        # so a linear scan is fine.
-        for i, off in enumerate(self._offsets):
-            shard = self._shards[i]
-            if idx < off + shard.shape[0]:
-                return shard[idx - off]
-        raise IndexError(idx)
+        if idx < 0 or idx >= self.total_tokens:
+            raise IndexError(idx)
+        shard_idx = bisect_right(self._offsets, idx) - 1
+        return self._shards[shard_idx][idx - self._offsets[shard_idx]]
 
 
 class ActivationDataLoader(DataLoader):

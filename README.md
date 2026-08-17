@@ -169,7 +169,7 @@ ignored (`-100`), consistent with training.
 | **Two-phase workflow** | init (template) → train, keeping config separate from code |
 | **CSV input** | `sequence` + `label` columns, automatic train/eval split |
 | **Ignore positions** | `_` labels are excluded from loss |
-| **Auto class weights** | `inverse` / `log` / `none` strategies |
+| **Auto class weights** | `inverse` / `sqrt` / `log` / `none` strategies |
 | **Configurable label maps** | `label_map:` in the config uses Single's presets (`mBMRB`, `relaxdb`, `ss3`) or a YAML file, instead of inferring from the CSV |
 | **Multi-class support** | Correct class count for many-to-one label maps (mBMRB, relaxdb, ss3) |
 | **Metrics** | Loss + Accuracy + Macro F1 + AUPRC (macro over all classes) |
@@ -251,15 +251,24 @@ activation and saves a normalized copy `sae/model_normalized.pt`. All analysis
 scripts load the SAE via `load_sae`, which **auto-prefers `model_normalized.pt`
 when present**, putting every feature on a comparable 0–1 scale (so a
 `--threshold_percents 0.15` means "activation > 15% of that feature's max").
-Re-running `train_sae` removes any stale `model_normalized.pt` so it is regenerated
-for the new model.
+On the **first** `analyze_features` run — before `model_normalized.pt` exists —
+`load_sae` falls back to the raw `model.pt`, so the metrics that run reports are
+computed at the **raw** activation scale; the normalized copy is written at the
+end of that run, and rerunning then produces the 0–1 normalized values.
+Re-running `train_sae` removes any stale `model_normalized.pt` so it is
+regenerated for the new model.
 
 **Filter/subset consistency.** Scripts that read the sequences CSV
 (`extract_embeddings`, `analyze_features`, `analyze_sequence`,
 `analyze_coactivation`, `visualize_features`) accept `--min_seq_len` /
 `--max_seq_len` / `--max_sequences`. If you used any of these flags during
-`extract_embeddings`, pass the **same values** here too — otherwise the
-protein/residue mapping silently misaligns. `--max_sequences N` draws a
+`extract_embeddings`, pass the **same values** here too. `extract_embeddings`
+writes per-shard residue metadata (`residues.csv`); `analyze_sequence` and
+`analyze_coactivation` derive the protein/residue mapping from that metadata
+when it is present, and a filter mismatch then **fails loudly** (token-count or
+unknown-protein errors) instead of misaligning silently. The other scripts
+re-derive the mapping from the CSV with the flags you pass, so matching the
+extraction filters is still required there. `--max_sequences N` draws a
 deterministic subset (fixed seed) so it's reproducible.
 
 **Configurable label maps.** Label encoding is not hardcoded to mBMRB. Every script
@@ -309,6 +318,11 @@ python crossplm.py single train_sae \
     --experiment demo --source mbmrb \
     --batch_size 64 --dict_size 640 --steps 20000 --l1_penalty 0.08 \
     --resample_steps 2000
+
+`--reconstruction_loss l2` preserves the legacy unsquared L2 objective. Use
+`--reconstruction_loss mse` to train with mean squared error instead. The default
+remains `l2`; changing the objective can require retuning `--l1_penalty` because
+the reconstruction-loss scale and gradients change.
 
 # Align features with task labels
 python crossplm.py single analyze_features \
@@ -365,10 +379,11 @@ python crossplm.py single analyze_concepts build \
 > **Alignment requirement:** the concept shards must contain the **same proteins,
 > in the same order, sharded identically** as the embedding shards. That means
 > extracting embeddings from the **same TSV** with the same `--n_shards` and the
-> same `--min_seq_len` / `--max_seq_len` length filter (concept building defaults
-> to `30` / `1022`), using `--sequence_column Sequence`. `--max_residues`
-> (`max_length` − 2) then makes concept rows cover exactly the residues the
-> embedder keeps on long sequences.
+> same `--min_seq_len` / `--max_seq_len` length filter, using
+> `--sequence_column Sequence`. (`analyze_concepts build` defaults to
+> `0` / `10000`; the examples below pass `30` / `1022` — use the **same values**
+> for extraction.) `--max_residues` (`max_length` − 2) then makes concept rows
+> cover exactly the residues the embedder keeps on long sequences.
 >
 > If the token counts of a concept shard and its embedding shard do not match,
 > `analyze_concepts align` now **fails with an error** (instead of silently
@@ -411,9 +426,11 @@ Top feature-concept associations (by F1):
   Feature #107 → Helix                          F1=0.588 AUROC=0.742 P=0.650 R=0.537
 ```
 
-**`f1` vs `f1_per_domain`:** `f1` counts residues (strict, skewed by domain length);
-`f1_per_domain` counts domain instances (a domain is "hit" if the feature activates
-anywhere within it). Prefer high `f1_per_domain` for robust concept recognition.
+**Residue vs domain metrics:** `f1`/`precision`/`recall` are residue-level metrics.
+`domain_precision`, `domain_recall`, and `domain_f1` use one-to-one matching between
+contiguous predicted activation segments and annotated domain instances. The legacy
+aliases `f1_per_domain` and `recall_per_domain` now point to the corresponding true
+domain-level values.
 
 ### 2.3 Validation & Fidelity
 
@@ -444,11 +461,20 @@ three ways and the model's **task loss** is compared:
 ```
 ce_orig : original activations
 ce_sae  : SAE reconstructions injected
-ce_zero : layer zeroed (worst case)
+ce_zero : layer zeroed (zero-ablation baseline)
 
 Loss_Recovered = 1 - (ce_sae - ce_orig) / (ce_zero - ce_orig)
 ```
-100% = perfectly preserves task info; 0% = as harmful as zeroing the layer.
+100% = perfectly preserves task info; 0% = as harmful as the zero-ablation
+baseline. If zero ablation does not increase loss, the recovery percentage is
+reported as invalid rather than interpreted as a recovery score.
+
+`loss_recovered_pct` is clipped to [0, 100] for display; the raw unclipped value
+is also saved as `loss_recovered_raw`. When the SAE reconstruction lowers the
+loss *below* the original activations (`sae_better_than_original=true`,
+`ce_sae < ce_orig`), the raw value exceeds 100% — that means the reconstruction
+denoises the activations rather than merely preserving them, and it should not be
+read as a recovery score.
 
 ```bash
 python crossplm.py single evaluate_fidelity \
@@ -511,8 +537,11 @@ sequence data (no 3D structures required):
   along the sequence (local/motif-like) or **dispersed** (global/periodic)?
   Negative d = clustered, ~0 = random, positive = dispersed.
 - **Motif enrichment** — which amino acids are over-represented in a window
-  (`--flank`, default 3) around the activated residues — the amino-acid
+  (`--flank`, default 5) around the activated residues — the amino-acid
   "signature" of the feature.
+- The positional motif analysis keeps each relative position separate, uses a
+  within-protein permutation null, and saves p-values, BH-FDR q-values, and
+  `sequence_logo_feature<N>.png`.
 
 ```bash
 python crossplm.py single analyze_sequence \
@@ -520,9 +549,12 @@ python crossplm.py single analyze_sequence \
     --sequences_csv Dataset/mBMRB.csv \
     --experiment demo --source mbmrb \
     --label_map mBMRB \
-    --feature_indices 375 42 \
-    --shard 0
+    --feature_indices 375 42
 ```
+
+By default all numeric shards are aggregated. Use `--shard 0` to run a quick
+single-shard test. The pooled result is saved as `sequence_analysis.json`;
+single-shard runs use `sequence_analysis_shard<N>.json`.
 
 Example output (Feature #42, the "flexibility detector"):
 ```
@@ -545,22 +577,32 @@ python crossplm.py single analyze_coactivation \
     --sequences_csv Dataset/mBMRB.csv \
     --experiment demo --source mbmrb \
     --label_map mBMRB \
-    --feature_a 375 --feature_b 42 \
-    --shard 0
+    --feature_a 375 --feature_b 42
 ```
 
-Key metrics (each compared to the unconditional activation-rate baseline):
-- `overlap_ab` / `enrich_ab` — same-residue co-activation; **>1** → B enriched on
-  A's residues, **<1** → mutually exclusive at the same position.
+By default all numeric shards are aggregated from raw token, overlap and
+neighborhood counts. Use `--shard 0` for a quick single-shard test.
+
+Key metrics (each compared to the appropriate null):
+- `overlap_ab` / `enrich_ab` — same-residue co-activation vs the unconditional
+  activation-rate baseline; **>1** → B enriched on A's residues, **<1** →
+  mutually exclusive at the same position.
 - `neighbor_ab` / `neighbor_enrich_ab` — B active within ±`--neighborhood`
-  residues of an A-active residue; **>>1** → features co-localize nearby.
+  residues, excluding the same residue, around an A-active residue.
+  `neighbor_enrich_ab` is normalized by the **independence null** (the expected
+  window-hit probability `1-(1-p)^(2k)` for independent features, boundary-aware
+  at protein ends), NOT by the per-token rate — a raw window probability is
+  already ~`2k × p` even for independent features. **>>1** → co-localization
+  beyond independence. Same-residue overlap is reported separately.
 - Both directions (A→B and B→A) are reported to detect asymmetry.
 
-Example (Features #375 and #42): same-residue enrichment **0.69×** (mutually
-exclusive at identical positions) but neighborhood enrichment **3.7–6.4×**
-(strongly co-localized within ±5 residues) → they are **complementary detectors
-that alternate along the sequence**, not redundant. Saves
-`coactivation_<a>_<b>_shard<N>.json`.
+Example (Features #375 and #42): same-residue enrichment **0.67×** (mutually
+exclusive at identical positions) but neighborhood enrichment **≈ 0.87–0.89× vs
+the independence null** (B is found near A about as often as chance predicts) →
+the two are **largely independent**, neither co-localized nor complementary.
+The null baselines (`neighbor_ab_null` / `neighbor_ba_null`) and the per-residue
+window-size histograms are saved alongside the probabilities.
+Saves `coactivation_<a>_<b>_shard<N>.json`.
 
 ---
 
@@ -624,14 +666,16 @@ Outputs/
         └── analysis/
             ├── feature_label_metrics.json         # Task-label alignment
             ├── feature_label_correlations.npy     # Point-biserial r per feature
+            ├── feature_label_correlation_stats.json # r, p-value, BH q-value/FDR
             ├── activation_profile.npz             # Per-class mean/max activation
             ├── max_activations_per_feature.pt     # Used to build model_normalized.pt
             ├── feature_concept_pairs.csv          # Feature × concept alignment
             ├── heldout_*.csv                      # Held-out validation
             ├── fidelity_results.json              # Fidelity
             ├── intervention_feat<N>_<mode>.json   # Causal intervention
-            ├── sequence_analysis_shard<N>.json    # Cohen's d + motif
-            ├── coactivation_<a>_<b>_shard<N>.json # Pairwise co-activation
+            ├── sequence_analysis.json              # Pooled Cohen's d + motif
+            ├── sequence_logo_feature<N>.png        # Positional motif logo
+            ├── coactivation_<a>_<b>.json           # Pooled pairwise co-activation
             └── visualizations/                    # PNG plots
 ```
 

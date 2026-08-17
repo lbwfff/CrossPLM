@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 import argparse
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -78,7 +79,12 @@ def extract_embeddings(
     # Shared loader: auto-detect separator, optional length filter (must MATCH
     # build_concept_matrix's filter so embedding/concept shards contain the SAME
     # proteins), and fixed-seed shuffle+shard — all in single.data.
-    from single.data import load_sequences_df, shuffled_shards
+    from single.data import (
+        load_sequences_df,
+        shuffled_shards,
+        sequence_hash,
+        validate_sequence_label_lengths,
+    )
     df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
                            min_seq_len=min_seq_len, max_seq_len=max_seq_len,
                            max_sequences=max_sequences)
@@ -88,6 +94,20 @@ def extract_embeddings(
     has_labels = label_column is not None and label_column in df.columns
     if has_labels:
         df[label_column] = df[label_column].fillna("").astype(str)
+        validate_sequence_label_lengths(df, sequence_column, label_column)
+
+    metadata = {
+        "sequence_column": sequence_column,
+        "label_column": label_column,
+        "max_length": max_length,
+        "min_seq_len": min_seq_len,
+        "max_seq_len": max_seq_len,
+        "max_sequences": max_sequences,
+        "n_shards": n_shards,
+        "shuffle_seed": 42,
+        "residues_per_sequence": None,
+    }
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
     # Same sharding as build_concept_matrix so shards align.
     if n_shards > 1:
@@ -109,6 +129,21 @@ def extract_embeddings(
                 )
                 result = {"embeddings": result}
             torch.save(result, shard_dir / "embeddings.pt")
+            residue_lengths = embedder.residue_lengths(shard_seqs, batch_size=batch_size)
+            residue_rows = []
+            for (_, row), residue_length in zip(shard_df.iterrows(), residue_lengths):
+                seq = str(row[sequence_column])
+                seq_hash = sequence_hash(seq)
+                for pos, aa in enumerate(seq[:residue_length]):
+                    residue = {
+                        "sequence_hash": seq_hash,
+                        "amino_acid": aa.upper(),
+                        "position": pos,
+                    }
+                    if "Entry" in shard_df.columns:
+                        residue["Entry"] = str(row["Entry"])
+                    residue_rows.append(residue)
+            pd.DataFrame(residue_rows).to_csv(shard_dir / "residues.csv", index=False)
 
             print(f"Shard {shard_id}: {result['embeddings'].shape[0]} tokens → {shard_dir / 'embeddings.pt'}")
     else:
@@ -123,6 +158,21 @@ def extract_embeddings(
             )
             result = {"embeddings": result}
         torch.save(result, output_dir / "embeddings.pt")
+        residue_lengths = embedder.residue_lengths(sequences, batch_size=batch_size)
+        residue_rows = []
+        for (_, row), residue_length in zip(df.iterrows(), residue_lengths):
+            seq = str(row[sequence_column])
+            seq_hash = sequence_hash(seq)
+            for pos, aa in enumerate(seq[:residue_length]):
+                residue = {
+                    "sequence_hash": seq_hash,
+                    "amino_acid": aa.upper(),
+                    "position": pos,
+                }
+                if "Entry" in df.columns:
+                    residue["Entry"] = str(row["Entry"])
+                residue_rows.append(residue)
+        pd.DataFrame(residue_rows).to_csv(output_dir / "residues.csv", index=False)
 
         print(f"Saved {result['embeddings'].shape[0]} tokens to {output_dir / 'embeddings.pt'}")
 

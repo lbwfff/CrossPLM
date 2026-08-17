@@ -26,6 +26,7 @@ Usage:
 """
 
 from pathlib import Path
+import copy
 from typing import Dict, Optional
 
 import yaml
@@ -74,14 +75,44 @@ LABEL_MAPS: Dict[str, Dict] = {
 
 def _normalize_spec(spec: Dict) -> Dict:
     """Fill defaults and validate a label-map spec."""
+    if not isinstance(spec, dict):
+        raise ValueError("label map must be a mapping/object")
+    spec = copy.deepcopy(spec)
     spec.setdefault("sequence_column", "sequence")
     spec.setdefault("label_column", "label")
     spec.setdefault("positive_class", 1)
     spec.setdefault("class_names", {})
     spec.setdefault("mapping", {})
     spec.setdefault("ignore", "_")
-    assert isinstance(spec["mapping"], dict) and spec["mapping"], \
-        "label map 'mapping' must be a non-empty dict of {char: class_id}"
+    if not isinstance(spec["mapping"], dict) or not spec["mapping"]:
+        raise ValueError(
+            "label map 'mapping' must be a non-empty dict of {char: class_id}"
+        )
+    if any(not isinstance(key, str) or len(key) != 1 for key in spec["mapping"]):
+        raise ValueError("label map mapping keys must be single-character strings")
+    class_ids = list(spec["mapping"].values())
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+           for value in class_ids):
+        raise ValueError("label map class ids must be non-negative integers")
+    expected_ids = set(range(max(class_ids) + 1))
+    if set(class_ids) != expected_ids:
+        raise ValueError(
+            "label map class ids must be contiguous and start at 0; "
+            f"got {sorted(set(class_ids))}"
+        )
+    if not isinstance(spec["positive_class"], int) or isinstance(spec["positive_class"], bool):
+        raise ValueError("label map positive_class must be an integer")
+    if spec["positive_class"] not in expected_ids:
+        raise ValueError(
+            f"positive_class {spec['positive_class']} is not present in class ids"
+        )
+    if not isinstance(spec["ignore"], str):
+        raise ValueError("label map ignore must be a string of ignored characters")
+    spec["class_names"] = {
+        int(key): str(value) for key, value in spec["class_names"].items()
+    }
+    for class_id in expected_ids - set(spec["class_names"]):
+        spec["class_names"][class_id] = str(class_id)
     return spec
 
 
@@ -131,7 +162,8 @@ def encode_label_string(label_str: str, spec: Dict) -> list:
         spec: normalized label-map spec from get_label_map()
     """
     mapping = spec["mapping"]
-    return [mapping.get(c, -100) for c in label_str]
+    ignored = set(spec.get("ignore", ""))
+    return [-100 if c in ignored else mapping.get(c, -100) for c in label_str]
 
 
 LABEL_MAP_TEMPLATE = """\

@@ -52,7 +52,7 @@ def evaluate(
     layer: int = 6,
     label_column: str = "label",
     sequence_column: str = "sequence",
-    label_map: str = "mBMRB",
+    label_map: Optional[str] = None,
     batch_size: int = 8,
     max_length: int = 512,
     max_sequences: Optional[int] = None,
@@ -75,7 +75,26 @@ def evaluate(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    label_map_spec = get_label_map(label_map)
+    if label_map is None:
+        sidecar = Path(ckpt_path) / "label_map.json"
+        if sidecar.exists():
+            with open(sidecar) as f:
+                saved = json.load(f)
+            label_map_spec = {
+                "mapping": {str(k): int(v) for k, v in saved["label2id"].items()},
+                "ignore": saved.get("ignore", "_"),
+                "positive_class": int(saved.get("positive_class", 1)),
+                "class_names": {
+                    int(k): str(v) for k, v in saved.get("id2label", {}).items()
+                },
+            }
+            print(f"Using label map from checkpoint: {sidecar}")
+        else:
+            label_map = "mBMRB"
+            label_map_spec = get_label_map(label_map)
+            print("No checkpoint label map found; falling back to mBMRB")
+    else:
+        label_map_spec = get_label_map(label_map)
     # The label map describes the dataset's columns; use them unless the user
     # explicitly overrode them on the command line.
     sequence_column, label_column = resolve_columns(
@@ -106,14 +125,11 @@ def evaluate(
         raise ValueError(f"feature_idx {feature_idx} out of range [0, {sae.dict_size})")
 
     print(f"\nLoading data from {sequences_csv}...")
-    with open(sequences_csv, "r") as f:
-        first = f.readline()
-    sep = "\t" if first.count("\t") > first.count(",") else ","
-    df = pd.read_csv(sequences_csv, sep=sep, low_memory=False)
-    df[sequence_column] = df[sequence_column].fillna("").astype(str)
+    from single.data import load_sequences_df, validate_sequence_label_lengths
+    df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
+                           max_sequences=max_sequences)
     df[label_column] = df[label_column].fillna("").astype(str)
-    if max_sequences is not None:
-        df = df.head(max_sequences)
+    validate_sequence_label_lengths(df, sequence_column, label_column)
     sequences = df[sequence_column].tolist()
     labels = df[label_column].tolist()
     print(f"  {len(sequences)} sequences")
@@ -182,7 +198,8 @@ def main(argv=None):
     parser.add_argument("--layer", type=int, default=6)
     parser.add_argument("--label_column", type=str, default="label")
     parser.add_argument("--sequence_column", type=str, default="sequence")
-    parser.add_argument("--label_map", type=str, default="mBMRB")
+    parser.add_argument("--label_map", type=str, default=None,
+                        help="Label map preset/YAML (default: checkpoint sidecar, then mBMRB)")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--max_sequences", type=int, default=None,

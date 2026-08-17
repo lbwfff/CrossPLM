@@ -23,12 +23,14 @@ Format of a single cell (Feature table):
     DISULFID      45..45.
 """
 
+import json
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from single.data import sequence_hash
 from scipy import sparse
 
 # Feature table column names in UniProtKB TSV
@@ -227,7 +229,7 @@ def compute_categorical_options(df: pd.DataFrame) -> Dict[str, set]:
 def expand_annotations_to_residues(
     df: pd.DataFrame,
     categorical_options: Optional[Dict[str, set]] = None,
-    max_residues: Optional[int] = None,
+    max_residues: Optional[int] = 510,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     Expand protein-level UniProt annotation columns to per-residue concept columns.
@@ -247,6 +249,7 @@ def expand_annotations_to_residues(
         concept_columns: list of concept column names
     """
     new_columns = {}
+    records = df.to_dict("records")
 
     def _per_residue_len(seq: str) -> int:
         """Residues kept per protein, matching the embedder's truncation."""
@@ -256,7 +259,7 @@ def expand_annotations_to_residues(
     for col in BINARY_CONCEPTS:
         col_name = column_to_prefix(col)
         concept_cols = []
-        for _, row in df.iterrows():
+        for row in records:
             indices = _process_binary(row[col], col_name, _per_residue_len(str(row["Sequence"])))
             concept_cols.append(indices)
         new_columns[col] = concept_cols
@@ -265,7 +268,7 @@ def expand_annotations_to_residues(
     for col in INTERACTION_CONCEPTS:
         col_name = column_to_prefix(col)
         concept_cols = []
-        for _, row in df.iterrows():
+        for row in records:
             indices = _process_interaction(row[col], col_name, _per_residue_len(str(row["Sequence"])))
             concept_cols.append(indices)
         new_columns[col] = concept_cols
@@ -277,7 +280,7 @@ def expand_annotations_to_residues(
         col_name = column_to_prefix(col)
         # Build per-category residue indices
         cat_columns = {f"{col}_{cat}": [] for cat in options}
-        for _, row in df.iterrows():
+        for row in records:
             cat_indices = _process_categorical(row[col], col_name, options,
                                                _per_residue_len(str(row["Sequence"])))
             for cat in options:
@@ -286,12 +289,21 @@ def expand_annotations_to_residues(
             new_columns[concept_name] = concept_lists
 
     # Build residue-level dataframe (truncated to max_residues per protein).
-    rows = []
-    for idx, row in df.iterrows():
-        seq = str(row["Sequence"])
-        for pos in range(_per_residue_len(seq)):
-            rows.append({"Entry": row["Entry"], "amino_acid": seq[pos], "position": pos})
-    result = pd.DataFrame(rows)
+    sequences = [str(row["Sequence"]) for row in records]
+    lengths = np.asarray([_per_residue_len(seq) for seq in sequences], dtype=np.int64)
+    kept_sequences = [seq[:length] for seq, length in zip(sequences, lengths)]
+    result = pd.DataFrame({
+        "Entry": np.repeat(df["Entry"].to_numpy(), lengths),
+        "sequence_hash": np.repeat(
+            [sequence_hash(seq) for seq in sequences], lengths
+        ),
+        "amino_acid": np.concatenate(
+            [np.fromiter(seq, dtype="U1") for seq in kept_sequences]
+        ) if lengths.sum() else np.empty(0, dtype="U1"),
+        "position": np.concatenate(
+            [np.arange(length, dtype=np.int64) for length in lengths]
+        ) if lengths.sum() else np.empty(0, dtype=np.int64),
+    })
 
     # Add concept columns as flattened per-residue values.
     # IMPORTANT: instance indices are per-protein (1,2,...). To make them globally
@@ -313,7 +325,10 @@ def expand_annotations_to_residues(
             )
         result[concept_name] = flattened
 
-    concept_columns = [c for c in result.columns if c not in ["Entry", "amino_acid", "position"]]
+    concept_columns = [
+        c for c in result.columns
+        if c not in ["Entry", "sequence_hash", "amino_acid", "position"]
+    ]
     return result, concept_columns
 
 
@@ -321,9 +336,9 @@ def build_concept_matrix(
     annotations_tsv: Path,
     output_dir: Path,
     n_shards: int = 5,
-    min_seq_len: int = 30,
-    max_seq_len: int = 1022,
-    max_residues: Optional[int] = None,
+    min_seq_len: int = 0,
+    max_seq_len: int = 10_000,
+    max_residues: Optional[int] = 510,
 ):
     """
     Convert a UniProtKB TSV into sharded per-residue sparse concept matrices.
@@ -339,6 +354,13 @@ def build_concept_matrix(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "metadata.json").write_text(json.dumps({
+        "min_seq_len": min_seq_len,
+        "max_seq_len": max_seq_len,
+        "max_residues": max_residues,
+        "n_shards": n_shards,
+        "shuffle_seed": 42,
+    }, indent=2))
 
     df = pd.read_csv(annotations_tsv, sep="\t", low_memory=False)
     df = df[df["Sequence"].notna()]
@@ -396,7 +418,7 @@ def build_concept_matrix(
         np.save(shard_dir / "n_domains_per_concept.npy", n_domains)
 
         # Save residue metadata
-        residue_df[["Entry", "amino_acid", "position"]].to_csv(
+        residue_df[["Entry", "sequence_hash", "amino_acid", "position"]].to_csv(
             shard_dir / "residues.csv", index=False
         )
 

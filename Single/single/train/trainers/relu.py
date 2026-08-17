@@ -50,6 +50,9 @@ class ReLUTrainer(SAETrainer):
         self.scheduler = t.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_fn)
 
         self.l1_penalty = cfg.l1_penalty
+        self.reconstruction_loss_name = str(cfg.reconstruction_loss).lower()
+        if self.reconstruction_loss_name not in {"l2", "mse"}:
+            raise ValueError("reconstruction_loss must be 'l2' or 'mse'")
         self.l1_penalty_warmup_steps = cfg.l1_penalty_warmup_steps
         self.l1_penalty_warmup_fn = get_sparsity_warmup_fn(
             self.steps, self.l1_penalty_warmup_steps
@@ -58,7 +61,7 @@ class ReLUTrainer(SAETrainer):
     def loss(self, x, step=None, logging=False, **kwargs):
         x_hat, f = self.ae(x, output_features=True)
 
-        l2_loss = t.linalg.norm(x - x_hat, dim=-1).mean()
+        reconstruction_loss = self.reconstruction_loss(x, x_hat)
         l1_loss = f.norm(p=1, dim=-1).mean()
 
         deads = (f == 0).all(dim=0)
@@ -66,7 +69,7 @@ class ReLUTrainer(SAETrainer):
         self.steps_since_active[~deads] = 0
 
         self.current_l1_penalty_scale = self.l1_penalty * self.l1_penalty_warmup_fn(step)
-        loss = l2_loss + l1_loss * self.current_l1_penalty_scale
+        loss = reconstruction_loss + l1_loss * self.current_l1_penalty_scale
 
         if not logging:
             return loss
@@ -76,11 +79,17 @@ class ReLUTrainer(SAETrainer):
             x_hat,
             f,
             {
-                "loss/reconstruction": l2_loss.item(),
+                "loss/reconstruction": reconstruction_loss.item(),
                 "loss/sparsity": l1_loss.item(),
                 "loss/total": loss.item(),
             },
         )
+
+    def reconstruction_loss(self, x, x_hat):
+        residual = x - x_hat
+        if self.reconstruction_loss_name == "mse":
+            return residual.pow(2).mean()
+        return t.linalg.norm(residual, dim=-1).mean()
 
     def update(self, step, x):
         x = x.to(self.device)

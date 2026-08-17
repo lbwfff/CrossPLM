@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -58,20 +58,83 @@ def get_sae_feats_in_batches(
     feat_list: Optional[List[int]] = None,
     normalize_features: bool = False,
     device: Optional[str] = None,
+    cache: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     if feat_list is None:
         feat_list = list(range(sae.dict_size))
 
-    if torch.is_tensor(aa_embds):
-        aa_embds = aa_embds.to(device)
-    else:
-        aa_embds = torch.tensor(aa_embds, device=device)
+    # TopK selection is global. Cache only sparse top-k indices/values rather
+    # than the dense [n_tokens, dict_size] activation matrix.
+    if cache is not None and isinstance(sae, TopKSAE):
+        cache_key = (id(sae), id(aa_embds), chunk_size, normalize_features, str(device))
+        if cache.get("key") != cache_key:
+            cache.clear()
+            cache["key"] = cache_key
+        if "indices" not in cache:
+            source = aa_embds if torch.is_tensor(aa_embds) else torch.as_tensor(aa_embds)
+            indices, values = [], []
+            k = min(int(sae.k.item()), sae.dict_size)
+            for i in range(0, len(source), chunk_size):
+                chunk = source[i : i + chunk_size].to(device)
+                full = sae.encode(chunk, normalize_features=normalize_features)
+                top_values, top_indices = full.topk(k, dim=-1, sorted=False)
+                indices.append(top_indices.detach().cpu())
+                values.append(top_values.detach().cpu())
+            cache["indices"] = torch.cat(indices, dim=0)
+            cache["values"] = torch.cat(values, dim=0)
+            cache["n_tokens"] = len(source)
+
+        selected = [int(f) for f in feat_list]
+        lookup = torch.full((sae.dict_size,), -1, dtype=torch.long, device=device)
+        lookup[torch.tensor(selected, dtype=torch.long, device=device)] = torch.arange(
+            len(selected), device=device
+        )
+        outputs = []
+        for i in range(0, cache["n_tokens"], chunk_size):
+            indices = cache["indices"][i : i + chunk_size].to(device)
+            values = cache["values"][i : i + chunk_size].to(device)
+            local_indices = lookup[indices]
+            valid = local_indices >= 0
+            output = torch.zeros(
+                indices.shape[0], len(selected), device=device, dtype=values.dtype
+            )
+            output.scatter_add_(
+                1, local_indices.clamp_min(0), values * valid.to(values.dtype)
+            )
+            outputs.append(output)
+        return torch.cat(outputs, dim=0)
+
+    if cache is not None:
+        cache_key = (id(sae), id(aa_embds), chunk_size, normalize_features, str(device))
+        if cache.get("key") != cache_key:
+            cache.clear()
+            cache["key"] = cache_key
+        source = aa_embds if torch.is_tensor(aa_embds) else torch.as_tensor(aa_embds)
+        estimated_bytes = len(source) * sae.dict_size * 4
+        max_cache_bytes = int(cache.get("max_cache_bytes", 512 * 1024 * 1024))
+        if estimated_bytes <= max_cache_bytes:
+            if "features" not in cache:
+                all_features = []
+                all_feature_ids = list(range(sae.dict_size))
+                for i in range(0, len(source), chunk_size):
+                    chunk = source[i : i + chunk_size].to(device)
+                    all_features.append(
+                        sae.encode_feat_subset(
+                            chunk, all_feature_ids,
+                            normalize_features=normalize_features,
+                        ).detach().cpu()
+                    )
+                cache["features"] = torch.cat(all_features, dim=0)
+            return cache["features"][..., feat_list].to(device)
+
+    if not torch.is_tensor(aa_embds):
+        aa_embds = torch.as_tensor(aa_embds)
 
     all_features = []
     for i in range(0, len(aa_embds), chunk_size):
-        chunk = aa_embds[i : i + chunk_size]
+        chunk = aa_embds[i : i + chunk_size].to(device)
         features = sae.encode_feat_subset(
             chunk, feat_list, normalize_features=normalize_features
         )

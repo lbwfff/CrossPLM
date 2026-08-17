@@ -165,17 +165,12 @@ class TopKSAE(Dictionary):
 
     @t.no_grad()
     def encode_feat_subset(self, x, feat_list, normalize_features: bool = False):
-        encoder_w_subset = self.encoder.weight[feat_list, :]
-        encoder_b_subset = self.encoder.bias[feat_list]
-        post_relu = t.nn.functional.relu(
-            (x - self.b_dec) @ encoder_w_subset.T + encoder_b_subset
-        )
-        topk = post_relu.topk(min(self.k, len(feat_list)), sorted=False, dim=-1)
-        buffer = t.zeros_like(post_relu)
-        encoded = buffer.scatter_(dim=-1, index=topk.indices, src=topk.values)
-        if normalize_features:
-            encoded /= self.activation_rescale_factor[feat_list]
-        return encoded
+        # Top-K selection is global — only the top-k features survive per token.
+        # A local Top-K over a subset would allow features that would NOT survive
+        # the full Top-K to appear as "active", producing spurious activations.
+        # Correct approach: full encode, then slice to the requested subset.
+        f = self.encode(x, normalize_features=normalize_features)
+        return f[..., feat_list]
 
     @classmethod
     def from_pretrained(cls, path, k=None, device=None):

@@ -26,6 +26,7 @@ class TrainingConfig:
     warmup_steps: int = 1000
     decay_start: int = 8000
     l1_penalty: float = 0.06
+    reconstruction_loss: str = "l2"  # l2 (legacy) or mse
     l1_penalty_warmup_steps: int = 500
     resample_steps: Optional[int] = None
     grad_clip_norm: float = 1.0

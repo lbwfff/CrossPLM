@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from scipy import sparse
+from scipy.stats import rankdata, t as student_t
 from sklearn.metrics import accuracy_score, precision_recall_curve, roc_auc_score
 from tqdm import tqdm
 
@@ -30,6 +31,8 @@ def align_features_to_labels(
     feature_chunk_size: int = 200,
     batch_size: int = 1024,
     positive_class: int = 1,
+    device: Optional[str] = None,
+    feature_cache: Optional[Dict] = None,
 ) -> Dict:
     """
     Align each SAE feature to the task labels.
@@ -46,10 +49,11 @@ def align_features_to_labels(
     if thresholds is None:
         thresholds = [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
 
-    device = embeddings.device
+    device = device or str(next(sae.parameters()).device)
     n_features = sae.dict_size
 
     best_metrics = {}
+    feature_cache = feature_cache if feature_cache is not None else {}
 
     for feature_list in tqdm(
         split_up_feature_list(n_features, feature_chunk_size),
@@ -62,6 +66,7 @@ def align_features_to_labels(
             feat_list=feature_list,
             normalize_features=True,
             device=str(device),
+            cache=feature_cache,
         )
         feats_np = feats.cpu().numpy()
         labels_np = labels.cpu().numpy()
@@ -140,13 +145,114 @@ def find_top_features_for_class(
     return scores[:n_top]
 
 
-def compute_feature_label_correlation(
+def _domain_instance_ranges(
+    domain_labels: np.ndarray,
+    protein_ids: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract contiguous domain-instance spans from a per-residue label column.
+
+    Each positive instance id (>0) occupies a contiguous residue run within a
+    single protein (annotations never cross protein boundaries), so runs are split
+    both on label change and on protein change. Returns (starts, ends, ids) arrays
+    with `end` exclusive and `starts` sorted ascending (ready for searchsorted).
+    """
+    domain_labels = np.asarray(domain_labels)
+    protein_ids = np.asarray(protein_ids)
+    change = np.r_[
+        True,
+        (domain_labels[1:] != domain_labels[:-1])
+        | (protein_ids[1:] != protein_ids[:-1]),
+        True,
+    ]
+    run_starts = np.flatnonzero(change[:-1])
+    # change[1:] is shifted by one position relative to the original index space,
+    # so the +1 recovers the true (exclusive) end positions.
+    run_ends = np.flatnonzero(change[1:]) + 1
+    labels_at_start = domain_labels[run_starts]
+    valid = labels_at_start > 0
+    return run_starts[valid], run_ends[valid], labels_at_start[valid]
+
+
+def _domain_confusion_from_segments(
+    seg_starts: np.ndarray,
+    seg_ends: np.ndarray,
+    dom_starts: np.ndarray,
+    dom_ends: np.ndarray,
+    dom_ids: np.ndarray,
+) -> Tuple[int, int, int]:
+    """Match predicted activation segments to annotated domain instances.
+
+    Same one-to-one greedy overlap semantics as the previous `_domain_confusion`,
+    but operates on precomputed segment/instance span tables via searchsorted
+    instead of rescanning the token array for every (feature, concept) pair.
+
+    A predicted domain is a contiguous activation run within one protein. A
+    predicted run and an annotated instance match when they overlap by at least
+    one residue; greedy matching by overlap gives one-to-one TP/FP/FN counts and
+    prevents one long prediction from matching several domains.
+    """
+    seg_starts = np.asarray(seg_starts, dtype=np.int64)
+    seg_ends = np.asarray(seg_ends, dtype=np.int64)
+    dom_starts = np.asarray(dom_starts, dtype=np.int64)
+    dom_ends = np.asarray(dom_ends, dtype=np.int64)
+    dom_ids = np.asarray(dom_ids)
+    n_domains = len(dom_ids)
+    n_segments = len(seg_starts)
+
+    # For every segment at once: the index one-past the last domain instance that
+    # starts strictly before the segment end (dom_starts is sorted ascending).
+    right = np.searchsorted(dom_starts, seg_ends - 1, side="right")
+
+    candidates = []
+    for seg_idx in range(n_segments):
+        s, e = seg_starts[seg_idx], seg_ends[seg_idx]
+        k = int(right[seg_idx]) - 1
+        while k >= 0 and dom_ends[k] > s:
+            overlap = min(e, int(dom_ends[k])) - max(s, int(dom_starts[k]))
+            if overlap > 0:
+                candidates.append((int(overlap), seg_idx, int(dom_ids[k])))
+            k -= 1
+
+    candidates.sort(reverse=True)
+    matched_segments = set()
+    matched_domains = set()
+    for _, seg_idx, domain_id in candidates:
+        if seg_idx in matched_segments or domain_id in matched_domains:
+            continue
+        matched_segments.add(seg_idx)
+        matched_domains.add(domain_id)
+
+    tp = len(matched_segments)
+    fp = len(seg_starts) - tp
+    fn = n_domains - tp
+    return tp, fp, fn
+
+
+def _benjamini_hochberg(p_values: np.ndarray) -> np.ndarray:
+    """Return Benjamini-Hochberg FDR-adjusted q-values."""
+    p_values = np.asarray(p_values, dtype=np.float64)
+    q_values = np.ones_like(p_values)
+    finite = np.isfinite(p_values)
+    indices = np.flatnonzero(finite)
+    if not len(indices):
+        return q_values
+    order = indices[np.argsort(p_values[indices])]
+    ranked = p_values[order] * len(order) / np.arange(1, len(order) + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    q_values[order] = np.minimum(ranked, 1.0)
+    return q_values
+
+
+def compute_feature_label_correlation_stats(
     sae: Dictionary,
     embeddings: torch.Tensor,
     labels: torch.Tensor,
     batch_size: int = 1024,
     positive_class: int = 1,
-) -> np.ndarray:
+    device: Optional[str] = None,
+    feature_cache: Optional[Dict] = None,
+    feature_chunk_size: int = 200,
+) -> Dict[str, np.ndarray]:
     """
     Compute point-biserial correlation between each feature's activation and the
     binary "is this residue in positive_class?" label (one-vs-rest).
@@ -155,32 +261,87 @@ def compute_feature_label_correlation(
     treated as the negative group; correlation measures how well the feature
     separates positive_class from everything else.
 
-    Returns array of shape (n_features,) with correlation coefficients.
+    Returns correlation, raw p-value, FDR q-value and valid-token count arrays.
     """
-    device = embeddings.device
+    device = device or str(next(sae.parameters()).device)
     n_features = sae.dict_size
     correlations = np.zeros(n_features)
+    p_values = np.ones(n_features)
+    n_valid_values = np.zeros(n_features, dtype=np.int64)
+    feature_cache = feature_cache if feature_cache is not None else {}
 
-    valid_mask = labels != -100
-    labels_bin = (labels[valid_mask] == positive_class).float().cpu().numpy()
+    valid_mask_np = (labels != -100).cpu().numpy()
+    labels_bin = (labels[valid_mask_np] == positive_class).float().cpu().numpy()
+    valid_mask_dev = torch.from_numpy(valid_mask_np).to(device)
 
-    for feat_idx in tqdm(range(n_features), desc="Computing correlations"):
+    # Process features in chunks (one SAE encode per chunk) instead of one encode
+    # per feature. Without a dense cache this is the difference between a few full
+    # passes and dict_size full passes over the dataset.
+    for feature_list in tqdm(
+        split_up_feature_list(n_features, feature_chunk_size),
+        desc="Computing correlations",
+    ):
         feats = get_sae_feats_in_batches(
             sae=sae,
             aa_embds=embeddings,
             chunk_size=batch_size,
-            feat_list=[feat_idx],
+            feat_list=feature_list,
             normalize_features=True,
             device=str(device),
+            cache=feature_cache,
         )
-        acts = feats[valid_mask].cpu().numpy().flatten()
+        # Index on device, then move only the valid rows to CPU.
+        acts = feats[valid_mask_dev].cpu().numpy()  # [n_valid, chunk]
+        n_obs = acts.shape[0]
+        chunk_corr = np.zeros(len(feature_list))
+        chunk_p = np.ones(len(feature_list))
 
-        # Point-biserial correlation = Pearson r between binary and continuous
-        if acts.std() > 0 and labels_bin.std() > 0:
-            corr = np.corrcoef(acts, labels_bin)[0, 1]
-            correlations[feat_idx] = corr
+        if n_obs >= 3 and labels_bin.std() > 0:
+            # Point-biserial correlation = Pearson r between each feature column
+            # and the binary label vector, computed vectorized over the chunk.
+            centered = acts - acts.mean(axis=0)
+            label_centered = labels_bin - labels_bin.mean()
+            denom = np.sqrt((centered ** 2).sum(axis=0) * (label_centered ** 2).sum())
+            with np.errstate(divide="ignore", invalid="ignore"):
+                corr = (centered.T @ label_centered) / denom
+            corr = np.nan_to_num(corr, nan=0.0)
+            corr = np.clip(corr, -1.0, 1.0)
+            t_stat = np.abs(corr) * np.sqrt(
+                (n_obs - 2) / np.maximum(1.0 - corr * corr, 1e-12)
+            )
+            p = np.where(
+                np.abs(corr) < 1.0,
+                2.0 * student_t.sf(t_stat, n_obs - 2),
+                0.0,
+            )
+            chunk_corr = corr
+            chunk_p = p
 
-    return correlations
+        correlations[feature_list] = chunk_corr
+        p_values[feature_list] = chunk_p
+        n_valid_values[feature_list] = n_obs
+
+    return {
+        "correlation": correlations,
+        "p_value": p_values,
+        "q_value": _benjamini_hochberg(p_values),
+        "n_valid": n_valid_values,
+    }
+
+
+def compute_feature_label_correlation(
+    sae: Dictionary,
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    batch_size: int = 1024,
+    positive_class: int = 1,
+    device: Optional[str] = None,
+) -> np.ndarray:
+    """Backward-compatible correlation-only wrapper."""
+    return compute_feature_label_correlation_stats(
+        sae, embeddings, labels, batch_size=batch_size,
+        positive_class=positive_class, device=device,
+    )["correlation"]
 
 
 def compute_feature_activation_profile(
@@ -194,6 +355,8 @@ def compute_feature_activation_profile(
     pos_name: str = "positive",
     neg_name: str = "negative",
     label_map_spec: Optional[dict] = None,
+    device: Optional[str] = None,
+    feature_cache: Optional[Dict] = None,
 ) -> Dict:
     """
     For each feature, compute mean/max activation per class.
@@ -204,7 +367,7 @@ def compute_feature_activation_profile(
     activation_gap is positive_class mean minus the mean over ALL other classes
     (so no class is silently ignored).
     """
-    device = embeddings.device
+    device = device or str(next(sae.parameters()).device)
     n_features = sae.dict_size
 
     # Determine classes: if a label_map_spec is given, iterate ALL of its classes;
@@ -216,9 +379,13 @@ def compute_feature_activation_profile(
 
     means = {c: np.zeros(n_features) for c in class_ids}
     maxes = {c: np.zeros(n_features) for c in class_ids}
-    masks = {c: (labels != -100) & (labels == c) for c in class_ids}
+    masks = {
+        c: ((labels != -100) & (labels == c)).cpu().numpy()
+        for c in class_ids
+    }
+    feature_cache = feature_cache if feature_cache is not None else {}
 
-    valid = labels != -100
+    valid = (labels != -100).cpu().numpy()
     # "other" = all valid residues not in the positive class (for activation_gap)
     if positive_class in class_ids:
         other_mask = valid & (labels != positive_class)
@@ -234,6 +401,7 @@ def compute_feature_activation_profile(
             feat_list=feature_list,
             normalize_features=True,
             device=str(device),
+            cache=feature_cache,
         )
         feats_np = feats.cpu().numpy()
 
@@ -290,6 +458,9 @@ def align_features_to_concepts(
     compute_auroc: bool = True,
     compute_domain_f1: bool = True,
     min_positives: int = 10,
+    fixed_thresholds: Optional[np.ndarray] = None,
+    protein_ids: Optional[np.ndarray] = None,
+    device: Optional[str] = None,
 ) -> Dict:
     """
     Align each SAE feature against every biological concept.
@@ -301,11 +472,10 @@ def align_features_to_concepts(
       of 0.15 means "activation > 15% of max". Only one scheme is used at a time;
       if `threshold_percents` is given it takes precedence.
 
-    Domain-level F1 (optional, like InterPLM):
-    For non-AA-level concepts (domains/regions/secondary structure), each annotation
-    instance is a distinct contiguous segment. `recall_per_domain` / `f1_per_domain`
-    count *instances* (domains) hit rather than residues, so long proteins don't
-    dominate. For AA-level concepts these equal the residue-based metrics.
+    Domain-level metrics (optional):
+    Each annotation instance is a true domain and each contiguous activation run
+    within a protein is a predicted domain. One-to-one overlap matching produces
+    domain_tp/domain_fp/domain_fn and the corresponding precision/recall/F1.
 
     Args:
         sae: trained SAE
@@ -322,17 +492,38 @@ def align_features_to_concepts(
     Returns dict mapping feature_idx -> { concept_name -> {f1, precision, recall,
         threshold, auroc, recall_per_domain, f1_per_domain, n_domains} }
     """
-    from single.analysis.concepts import is_aa_level_concept
-
     if thresholds is None:
         thresholds = [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
     if threshold_percents is not None:
         thresholds = threshold_percents  # percent-of-max thresholds take precedence
 
-    device = embeddings.device
+    fixed = None
+    if fixed_thresholds is not None:
+        fixed = np.asarray(fixed_thresholds, dtype=np.float32)
+        if fixed.shape != (sae.dict_size, concept_matrix.shape[1]):
+            raise ValueError(
+                "fixed_thresholds must have shape "
+                f"({sae.dict_size}, {concept_matrix.shape[1]}), got {fixed.shape}"
+            )
+        extra = fixed[np.isfinite(fixed)]
+        thresholds = sorted(set(float(t) for t in thresholds) | set(extra.tolist()))
+
+    device = device or str(next(sae.parameters()).device)
     n_features = sae.dict_size
     n_concepts = concept_matrix.shape[1]
     n_tokens = embeddings.shape[0]
+    if protein_ids is None:
+        # External callers may not have residue metadata. Keep the function
+        # usable, but make the fallback conservative: every row is its own
+        # protein and therefore cannot form a multi-residue predicted domain.
+        protein_ids = np.arange(n_tokens, dtype=np.int64)
+    else:
+        protein_ids = np.asarray(protein_ids)
+        if len(protein_ids) != n_tokens:
+            raise ValueError(
+                f"protein_ids length {len(protein_ids)} does not match "
+                f"embeddings length {n_tokens}"
+            )
 
     # Keep concepts sparse; keep original instance indices for domain counting,
     # and build a binarized copy for residue-level TP/FP.
@@ -350,20 +541,23 @@ def align_features_to_concepts(
     valid_concepts = n_pos >= min_positives
     valid_idx = np.where(valid_concepts)[0]
 
-    # Domain counts per concept (unique positive instance indices)
+    # Domain instance spans per concept, computed ONCE and reused across every
+    # threshold and feature (previously the label column was rescanned inside the
+    # threshold loop, making domain-F1 O(thr x concepts x features x tokens) in
+    # pure Python).
+    domain_tables = {}
     if compute_domain_f1:
         n_domains = np.zeros(n_concepts, dtype=np.float64)
         for c in valid_idx:
-            col_data = labels.getcol(c).data
-            if col_data.size:
-                n_domains[c] = len(np.unique(col_data[col_data > 0]))
-
-    # aa-level vs domain-level concepts
-    is_aa = [is_aa_level_concept(name) for name in concept_names] if compute_domain_f1 else [True] * n_concepts
+            col = labels.getcol(c).toarray().ravel()
+            starts, ends, ids = _domain_instance_ranges(col, protein_ids)
+            domain_tables[c] = (starts, ends, ids)
+            n_domains[c] = len(ids)
 
     thresholds_arr = np.array(thresholds, dtype=np.float32)
 
     result = {int(f): {} for f in range(n_features)}
+    feature_cache = {}
 
     for feature_list in tqdm(
         split_up_feature_list(n_features, feature_chunk_size),
@@ -376,17 +570,28 @@ def align_features_to_concepts(
             feat_list=feature_list,
             normalize_features=True,
             device=str(device),
+            cache=feature_cache,
         )
         feats_np = feats.cpu().numpy()
         f_chunk = len(feature_list)
 
         # Best-metric arrays across all (feature, concept) pairs in this chunk
-        best_f1 = np.zeros((f_chunk, n_concepts))
+        best_f1 = np.full(
+            (f_chunk, n_concepts), -1.0 if fixed is not None else 0.0
+        )
         best_prec = np.zeros((f_chunk, n_concepts))
         best_rec = np.zeros((f_chunk, n_concepts))
         best_thr = np.zeros((f_chunk, n_concepts))
         best_thr_idx = np.zeros((f_chunk, n_concepts), dtype=int)
-        best_rec_domain = np.zeros((f_chunk, n_concepts))
+        best_domain_precision = np.zeros((f_chunk, n_concepts))
+        best_domain_recall = np.zeros((f_chunk, n_concepts))
+        best_domain_f1 = np.zeros((f_chunk, n_concepts))
+        best_domain_tp = np.zeros((f_chunk, n_concepts))
+        best_domain_fp = np.zeros((f_chunk, n_concepts))
+        best_domain_fn = np.zeros((f_chunk, n_concepts))
+        best_tp = np.zeros((f_chunk, n_concepts))
+        best_fp = np.zeros((f_chunk, n_concepts))
+        best_fn = np.zeros((f_chunk, n_concepts))
 
         # ---- Vectorized threshold scan ----
         # For each threshold: tp[f, c] = preds[f].T @ labels[c] via one sparse matmul
@@ -399,37 +604,93 @@ def align_features_to_concepts(
             rec = tp / (tp + fn + 1e-10)
             f1 = 2 * prec * rec / (prec + rec + 1e-10)
 
-            # Domain-level recall at this threshold (only for domain-level concepts)
-            rec_dom = rec.copy()
+            # Domain-level metrics use one-to-one matching between contiguous
+            # predicted activation segments and annotated domain instances.
+            domain_precision = np.zeros((f_chunk, n_concepts))
+            domain_recall = np.zeros((f_chunk, n_concepts))
+            domain_f1 = np.zeros((f_chunk, n_concepts))
+            domain_tp = np.zeros((f_chunk, n_concepts))
+            domain_fp = np.zeros((f_chunk, n_concepts))
+            domain_fn = np.zeros((f_chunk, n_concepts))
             if compute_domain_f1:
-                # Vectorized domain counting: for each concept, group activated
-                # residues by domain-instance id, OR-reduce across features, then
-                # count how many distinct instances each feature hit.
+                # Predicted activation segments for every feature in the chunk.
+                # A segment must stay within one protein (split at protein change)
+                # and cannot span inactive tokens.
                 preds_bool = preds > 0  # [n, f_chunk]
+                prev_pred = np.concatenate(
+                    [np.zeros((1, f_chunk), dtype=bool), preds_bool[:-1, :]], axis=0
+                )
+                prev_same = np.concatenate(
+                    [
+                        np.zeros((1, 1), dtype=bool),
+                        (protein_ids[1:] == protein_ids[:-1])[:, None],
+                    ],
+                    axis=0,
+                )
+                is_start = preds_bool & ~(prev_pred & prev_same)
+                next_pred = np.concatenate(
+                    [preds_bool[1:, :], np.zeros((1, f_chunk), dtype=bool)], axis=0
+                )
+                next_same = np.concatenate(
+                    [
+                        (protein_ids[1:] == protein_ids[:-1])[:, None],
+                        np.zeros((1, 1), dtype=bool),
+                    ],
+                    axis=0,
+                )
+                is_end = preds_bool & ~(next_pred & next_same)
+                # Segments depend only on the feature, so compute them once per
+                # feature and reuse across concepts.
+                for j in range(f_chunk):
+                    seg_starts = np.flatnonzero(is_start[:, j])
+                    if seg_starts.size == 0:
+                        continue
+                    seg_ends = np.flatnonzero(is_end[:, j]) + 1
+                    for c in valid_idx:
+                        starts, ends, ids = domain_tables[c]
+                        d_tp, d_fp, d_fn = _domain_confusion_from_segments(
+                            seg_starts, seg_ends, starts, ends, ids
+                        )
+                        domain_tp[j, c] = d_tp
+                        domain_fp[j, c] = d_fp
+                        domain_fn[j, c] = d_fn
                 for c in valid_idx:
-                    if is_aa[c]:
-                        continue
-                    col = labels.getcol(c).tocoo()
-                    ids_arr = col.data.astype(np.int64)
-                    rows_arr = col.row
-                    if ids_arr.size == 0:
-                        continue
-                    order = np.argsort(ids_arr, kind="mergesort")
-                    s_rows = rows_arr[order]
-                    s_ids = ids_arr[order]
-                    change = np.concatenate(([0], np.nonzero(np.diff(s_ids))[0] + 1))
-                    # OR-reduce activated rows per instance group: [n_groups, f_chunk]
-                    group_or = np.maximum.reduceat(preds_bool[s_rows], change, axis=0)
-                    hits = group_or.sum(axis=0)  # [f_chunk] unique instances hit per feature
-                    rec_dom[:, c] = hits / max(n_domains[c], 1)
+                    domain_precision[:, c] = domain_tp[:, c] / np.maximum(
+                        domain_tp[:, c] + domain_fp[:, c], 1e-10
+                    )
+                    domain_recall[:, c] = domain_tp[:, c] / np.maximum(
+                        domain_tp[:, c] + domain_fn[:, c], 1e-10
+                    )
+                    domain_f1[:, c] = (
+                        2 * domain_precision[:, c] * domain_recall[:, c]
+                        / np.maximum(domain_precision[:, c] + domain_recall[:, c], 1e-10)
+                    )
 
-            better = f1 > best_f1
+            if fixed is None:
+                allowed = True
+            else:
+                allowed = np.isclose(
+                    float(t), fixed[np.asarray(feature_list), :], atol=1e-6
+                )
+            better = allowed & (f1 > best_f1)
             best_f1 = np.where(better, f1, best_f1)
             best_prec = np.where(better, prec, best_prec)
             best_rec = np.where(better, rec, best_rec)
             best_thr = np.where(better, t, best_thr)
             best_thr_idx = np.where(better, t_idx, best_thr_idx)
-            best_rec_domain = np.where(better, rec_dom, best_rec_domain)
+            best_domain_precision = np.where(
+                better, domain_precision, best_domain_precision
+            )
+            best_domain_recall = np.where(
+                better, domain_recall, best_domain_recall
+            )
+            best_domain_f1 = np.where(better, domain_f1, best_domain_f1)
+            best_tp = np.where(better, tp, best_tp)
+            best_fp = np.where(better, fp, best_fp)
+            best_fn = np.where(better, fn, best_fn)
+            best_domain_tp = np.where(better, domain_tp, best_domain_tp)
+            best_domain_fp = np.where(better, domain_fp, best_domain_fp)
+            best_domain_fn = np.where(better, domain_fn, best_domain_fn)
 
         # ---- Vectorized AUROC (per-feature rank sum) ----
         if compute_auroc:
@@ -438,9 +699,7 @@ def align_features_to_concepts(
                 col = feats_np[:, j]
                 if col.max() == 0:
                     continue
-                order = np.argsort(col, kind="mergesort")
-                ranks = np.empty(n_tokens, dtype=np.float64)
-                ranks[order] = np.arange(1, n_tokens + 1)
+                ranks = rankdata(col, method="average")
                 rank_sum_pos = np.asarray(labels_float.T @ ranks).ravel()  # [c]
                 denom = n_pos * n_neg
                 valid = denom > 0
@@ -451,7 +710,10 @@ def align_features_to_concepts(
             auroc = np.full((f_chunk, n_concepts), 0.5)
 
         # ---- Fill results (only for valid concepts with positive F1) ----
-        nz_pairs = np.argwhere(best_f1 > 0)
+        emit_mask = best_f1 > 0
+        if fixed is not None:
+            emit_mask |= np.isfinite(fixed[np.asarray(feature_list), :])
+        nz_pairs = np.argwhere(emit_mask)
         for j, c in nz_pairs:
             if not valid_concepts[c]:
                 continue
@@ -462,19 +724,24 @@ def align_features_to_concepts(
                 "recall": float(best_rec[j, c]),
                 "threshold": float(best_thr[j, c]),
                 "auroc": float(auroc[j, c]),
+                # Sufficient statistics for exact aggregation across shards.
+                "tp": float(best_tp[j, c]),
+                "fp": float(best_fp[j, c]),
+                "fn": float(best_fn[j, c]),
+                "n_tokens": int(n_tokens),
+                "n_positives": int(n_pos[c]),
             }
             if compute_domain_f1:
-                if is_aa[c]:
-                    entry["recall_per_domain"] = entry["recall"]
-                    entry["f1_per_domain"] = entry["f1"]
-                    entry["n_domains"] = int(n_domains[c])
-                else:
-                    rec_dom = best_rec_domain[j, c]
-                    p = entry["precision"]
-                    f1_dom = 2 * p * rec_dom / (p + rec_dom + 1e-10) if rec_dom > 0 else 0.0
-                    entry["recall_per_domain"] = float(rec_dom)
-                    entry["f1_per_domain"] = float(f1_dom)
-                    entry["n_domains"] = int(n_domains[c])
+                entry["domain_tp"] = float(best_domain_tp[j, c])
+                entry["domain_fp"] = float(best_domain_fp[j, c])
+                entry["domain_fn"] = float(best_domain_fn[j, c])
+                entry["domain_precision"] = float(best_domain_precision[j, c])
+                entry["domain_recall"] = float(best_domain_recall[j, c])
+                entry["domain_f1"] = float(best_domain_f1[j, c])
+                entry["n_domains"] = int(n_domains[c])
+                # Deprecated aliases retained for downstream readers.
+                entry["recall_per_domain"] = entry["domain_recall"]
+                entry["f1_per_domain"] = entry["domain_f1"]
             result[fidx][concept_names[c]] = entry
 
     return result

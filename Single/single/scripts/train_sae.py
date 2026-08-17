@@ -15,6 +15,10 @@ Usage:
 
 import os
 import sys
+import random
+
+import numpy as np
+import torch
 
 # Allow running directly from the repository root, e.g.
 #   python Single/single/scripts/analyze_sequence.py ...
@@ -45,6 +49,7 @@ def train_sae(
     steps: int = 10000,
     batch_size: int = 512,
     l1_penalty: float = 0.06,
+    reconstruction_loss: str = "l2",
     warmup_steps: int = 1000,
     decay_start: int = 8000,
     resample_steps: Optional[int] = None,
@@ -60,6 +65,13 @@ def train_sae(
         raise ValueError("Must provide either --experiment or --exp_dir")
     exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=source)
     print(f"Experiment dir: {exp.dir}")
+
+    # Seed all random sources for reproducible SAE init and dead-neuron resampling.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     # Prefer explicit embeddings_dir; else infer Outputs/<exp>/embeddings/layer_<N>
     # (which contains ALL shards for that layer — shard_0..shard_N-1).
@@ -95,6 +107,7 @@ def train_sae(
         warmup_steps=warmup_steps,
         decay_start=decay_start,
         l1_penalty=l1_penalty,
+        reconstruction_loss=reconstruction_loss,
         resample_steps=resample_steps,
         seed=seed,
     )
@@ -112,6 +125,7 @@ def train_sae(
     print(f"Model: {activation_dim}D → {dict_size} features")
     print(f"Steps: {steps}, Batch: {batch_size}, LR: {lr:.1e}")
     print(f"L1 penalty: {l1_penalty}")
+    print(f"Reconstruction loss: {reconstruction_loss}")
     print(f"Save to: {save_dir}")
     print()
 
@@ -164,6 +178,8 @@ def main(argv=None):
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--l1_penalty", type=float, default=0.06)
+    parser.add_argument("--reconstruction_loss", choices=("l2", "mse"), default="l2",
+                        help="Reconstruction loss: legacy unsquared L2 or MSE")
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--decay_start", type=int, default=8000)
     parser.add_argument("--resample_steps", type=int, default=None,
