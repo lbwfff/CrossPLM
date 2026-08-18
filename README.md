@@ -608,7 +608,9 @@ Saves `coactivation_<a>_<b>_shard<N>.json`.
 
 ## Module 3: Crossing — Planned
 
-Not yet implemented. Planned directions:
+Not yet implemented. See the detailed
+[Crossing module roadmap](Crossing/ROADMAP.en.md) for the full plan. Planned
+directions:
 
 - **Single-model**: neuron / attention-head importance, representation probing.
 - **Cross-model**: comparative analysis across PLMs (ESM-2, ProtBERT, Ankh),
