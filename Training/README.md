@@ -98,10 +98,10 @@ Edit `Outputs/my_experiment/config.yaml`, then:
 python crossplm.py training train --config Outputs/my_experiment/config.yaml
 ```
 
-Checkpoints, training curve, and logs are saved inside the experiment folder.
+Checkpoints, training curve, logs and a `provenance.json` (dataset `sha256`, split, backbone, freeze settings and full config snapshot) plus `config_snapshot.yaml` are saved inside the experiment folder. The training also writes `Outputs/<task>/config_snapshot.yaml` so the run is reproducible even if `Outputs/<task>/config.yaml` was edited after `init`.
 
 The config's `label_map:` field takes a preset name or YAML path. Leave it
-empty to infer the mapping from the CSV (legacy).
+empty to infer the mapping from the CSV (e.g. `Training/examples/sample.csv` uses `label_map: ""` with `H/E` labels inferred as `E:0, H:1`).
 
 ### Config fields
 
@@ -109,21 +109,26 @@ empty to infer the mapping from the CSV (legacy).
 |-------|---------|-------------|
 | `task_name` | `my_plm_task` | Identifier (for logging only) |
 | `model_name` | `esm2_t6_8M` | Name used when saving the model |
-| `backbone_model_id` | `facebook/esm2_t6_8M_UR50D` | HuggingFace backbone model ID |
+| `backbone_model_id` | `facebook/esm2_t6_8M_UR50D` | HuggingFace backbone model ID — native `facebook/esm2_*` and `Synthyra/ESM2-8M` (FastPLMs) both supported (`trust_remote_code=True` is handled automatically) |
 | `csv_data_path` | `../Dataset/mBMRB.csv` | Training CSV (relative to `Training/`) |
 | `sequence_column` / `label_column` | `sequence` / `label` | CSV column names (overridden by `label_map`) |
 | `train_ratio` | `0.9` | Train/eval split fraction |
 | `task_type` | `token_classification` | Only `token_classification` implemented (`mlm` reserved) |
 | `max_seq_length` | `512` | Max sequence length (truncate longer) |
 | `per_device_train_batch_size` / `per_device_eval_batch_size` | `8` / `8` | Batch sizes |
+| `gradient_accumulation_steps` | `1` | Accumulate grads over N batches |
 | `learning_rate` | `2.0e-5` | Learning rate |
+| `weight_decay` | `0.01` | Weight decay |
 | `num_train_epochs` | `3` | Number of epochs |
 | `max_steps` | `-1` | `-1` = determined by epochs |
 | `logging_steps` / `eval_steps` / `save_steps` | `10` / `500` / `1000` | Step intervals |
-| `save_total_limit` | `3` | Keep newest N checkpoints |
+| `save_total_limit` | `3` | Keep newest N periodic + best-F1 checkpoints |
 | `class_weight_method` | `inverse` | `none` / `inverse` / `sqrt` / `log` |
 | `seed` | `42` | Random seed |
+| `dataloader_num_workers` | `2` | DataLoader workers |
 | `fp16` / `bf16` | `false` / `false` | Mixed-precision AMP (requires CUDA; `bf16` prefers Ampere+) |
+| `freeze_backbone` | `false` | If `true`, freeze all encoder layers and train only the classifier head (Phase 0 control) |
+| `freeze_layers` | `0` | Freeze bottom N encoder layers (`0`=none; ignored when `freeze_backbone=true`) |
 | `label_map` | `mBMRB` | Preset name or YAML path (shared with Single) |
 
 ## 3. Evaluate a Checkpoint
@@ -176,6 +181,9 @@ recommended for older checkpoints.
 | **Auto class weights** | `inverse` / `sqrt` / `log` / `none` strategies |
 | **Configurable label maps** | Presets or YAML, shared with Single |
 | **Multi-class support** | Correct class count for many-to-one label maps |
+| **Backbone compatibility** | Native `facebook/esm2_*` and `Synthyra/ESM2-*` (FastPLMs, `trust_remote_code=True`) |
+| **Freeze control** | `freeze_backbone` / `freeze_layers` for Phase 0 pre-existing vs emergent controls |
+| **Provenance** | `provenance.json` + `config_snapshot.yaml` capture dataset hash, split and config for reproducibility |
 | **Metrics** | Loss + Accuracy + Macro F1 + AUPRC (macro over all classes) |
 | **Mixed precision** | `fp16` / `bf16` AMP on CUDA GPUs (auto-disabled on CPU) |
 | **Top-3 checkpoints** | Keeps best 3 by F1, cleans old ones; `best` is a stable alias |

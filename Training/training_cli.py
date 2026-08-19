@@ -160,6 +160,8 @@ def cmd_train(args):
         backbone_model_id=config.backbone_model_id,
         task_type=config.task_type,
         num_labels=n_classes,
+        freeze_backbone=bool(getattr(config, "freeze_backbone", False)),
+        freeze_layers=int(getattr(config, "freeze_layers", 0) or 0),
     )
 
     # Persist the training-time label map into the model config so downstream
@@ -191,6 +193,62 @@ def cmd_train(args):
     class_weights = compute_class_weights_from_dataset(
         train_dataset, label_map, config.class_weight_method
     )
+
+    # --- Provenance (T2): dataset hash, split, backbone, freeze control ---
+    # This file is the "birth certificate" for the experiment so that a later
+    # SAE comparison (M0 vs MA vs MB) can prove the two models saw the same
+    # validation set and the same CSV revision.
+    try:
+        import hashlib
+        import json as _json
+        from dataclasses import asdict as _asdict
+
+        def _sha256(path: str) -> str:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+
+        csv_sha = _sha256(csv_path) if os.path.exists(csv_path) else None
+        # random_split indices are not exposed; record the deterministic split
+        # parameters plus resulting sizes so a later rerun can be compared.
+        provenance = {
+            "task_name": config.task_name,
+            "model_name": config.model_name,
+            "backbone_model_id": config.backbone_model_id,
+            "csv_data_path": config.csv_data_path,
+            "csv_resolved_path": csv_path,
+            "csv_sha256": csv_sha,
+            "sequence_column": seq_col,
+            "label_column": lbl_col,
+            "label_map_preset": config.label_map,
+            "label_map": label_map,
+            "ignore_chars": sorted(ignore_chars),
+            "train_ratio": config.train_ratio,
+            "seed": config.seed,
+            "max_seq_length": config.max_seq_length,
+            "freeze_backbone": bool(getattr(config, "freeze_backbone", False)),
+            "freeze_layers": int(getattr(config, "freeze_layers", 0) or 0),
+            "n_sequences_total": len(sequences),
+            "n_valid_residues": int(valid),
+            "train_size": len(train_dataset),
+            "eval_size": len(eval_dataset),
+            # Full config snapshot for exact reproduction
+            "config_snapshot": _asdict(config),
+        }
+        prov_path = os.path.join(task_dir, "provenance.json")
+        with open(prov_path, "w") as f:
+            _json.dump(provenance, f, indent=2, sort_keys=False, ensure_ascii=False)
+        print(f"[Provenance] saved to {prov_path} (csv_sha256={csv_sha[:12] if csv_sha else 'n/a'}...)")
+
+        # Also persist a verbatim copy of the resolved config so
+        # `Outputs/<task>/config.yaml` always reflects the run, not just the
+        # template created at `init` time.
+        snapshot_path = os.path.join(task_dir, "config_snapshot.yaml")
+        config.to_yaml(snapshot_path)
+    except Exception as e:
+        print(f"[Provenance] warning: failed to write provenance ({e})")
 
     print("[Training...]")
     trainer = Trainer(

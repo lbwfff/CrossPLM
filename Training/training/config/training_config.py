@@ -41,6 +41,14 @@ class TrainingConfig:
     class_weight_method: str = "inverse"
     ignore_pad_token_for_loss: bool = True
     resume_from_checkpoint: Optional[str] = None  # reserved (not implemented)
+    # Freeze backbone encoder (only train the classification head). Useful for
+    # Phase 0 control: compare frozen vs full fine-tuning to tell whether a
+    # shared SAE feature is pre-existing (M0) or emergent during fine-tuning.
+    freeze_backbone: bool = False
+    # Optionally freeze the bottom N encoder layers (0 = none). When
+    # freeze_backbone is True this is ignored. Requires the backbone to expose
+    # an encoder stack (e.g. ESM's `esm.encoder.layer`).
+    freeze_layers: int = 0
     # Optional label-map preset (from Single's single/label_maps.py) or a path to
     # a YAML label-map file. This is the SAME label encoding used by the
     # interpretability module, so Training and Single always interpret a dataset
@@ -145,6 +153,10 @@ save_total_limit: 3
 #   sqrt     = sqrt of inverse ratio (gentler; try this if precision is low)
 #   log      = log scaling (gentler)
 class_weight_method: inverse
+
+# ----- Freeze control (Phase 0 provenance) -----
+freeze_backbone: false   # true = freeze all encoder parameters, train only classifier head
+freeze_layers: 0         # 0 = none; N > 0 freezes the bottom N encoder layers
 
 # ----- Other -----
 seed: 42

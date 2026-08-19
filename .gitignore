@@ -52,5 +52,6 @@ CURRENT_CODE_REVIEW.md
 Crossing/ROADMAP.md
 Crossing/comment.md
 
-# GUI module — under construction, not yet tracked
-gui/
+# GUI module — file_picker component requires no extra dependencies
+# (keep __pycache__ ignored via the global rule above)
+# gui/ is now tracked — see gui/app.py and gui/file_picker.py

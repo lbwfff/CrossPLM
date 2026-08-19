@@ -40,8 +40,17 @@ class Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.model.to(self.device)
 
+        # Only optimise parameters that require grad — respects
+        # PLMModel freeze_backbone / freeze_layers so the optimizer does not
+        # hold state for frozen weights.
+        trainable_params = [p for p in self.model.model.parameters() if p.requires_grad]
+        if len(trainable_params) == 0:
+            raise ValueError("No trainable parameters — check freeze_backbone / freeze_layers settings")
+        if len(trainable_params) < sum(1 for _ in self.model.model.parameters()):
+            print(f"[Trainer] Optimizing {len(trainable_params)} trainable param groups "
+                  f"(frozen params excluded from optimizer)")
         self.optimizer = AdamW(
-            self.model.model.parameters(),
+            trainable_params,
             lr=float(config.learning_rate),
             betas=(float(config.adam_beta1), float(config.adam_beta2)),
             eps=float(config.adam_epsilon),

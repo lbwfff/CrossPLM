@@ -4,35 +4,57 @@ task_name: my_plm_task
 model_name: esm2_t6_8M
 # HuggingFace 上的 backbone 模型 ID
 backbone_model_id: facebook/esm2_t6_8M_UR50D
-# 训练数据 CSV 文件路径（必填）
+# 训练数据 CSV 文件路径（必填）。相对路径基于 Training/ 目录解析，
+# 所以 "../Dataset/mBMRB.csv" 指向仓库的 Dataset/ 目录；示例用本地 sample.csv
 csv_data_path: ./examples/sample.csv
-# CSV 中序列列的列名
+
+# 统一 label_map（与 Single 模块共用）：
+#   预设名: mBMRB | relaxdb | ss3
+#   或 YAML 文件路径。留空则从 CSV 推断（旧行为）。
+#   示例的 sample.csv 使用 H/E 标签，从 CSV 推断即可；若改用
+#   ../Dataset/mBMRB.csv 请改回 mBMRB。
+label_map: ""
+
+# CSV 中序列列 / 标签列的列名（当 label_map 为空时生效，或覆盖预设）
 sequence_column: sequence
-# CSV 中标签列的列名（每个字符对应一个氨基酸的标签）
 label_column: label
+
 # 训练集划分比例，剩余为验证集
 train_ratio: 0.9
-# 任务类型: token_classification | mlm
+# 任务类型: token_classification（mlm 保留未实现）
 task_type: token_classification
 # 序列最大长度（超过截断）
 max_seq_length: 512
-# 仅在 task_type=mlm 时生效，掩码比例
+# 仅在 task_type=mlm 时生效，掩码比例（保留）
 mlm_probability: 0.15
-# 单设备训练 batch size
+
+# ----- 训练超参 -----
 per_device_train_batch_size: 2
-# 单设备评估 batch size
 per_device_eval_batch_size: 2
-# 学习率
-learning_rate: 2e-5
-# 训练轮数
+gradient_accumulation_steps: 1
+learning_rate: 2.0e-5
+weight_decay: 0.01
 num_train_epochs: 1
-# 最大训练步数（-1 表示由 epoch 决定）
-max_steps: -1
-# 每多少步打印一次日志
+max_steps: -1           # -1 表示由 num_train_epochs 决定
+
+# ----- 日志与保存 -----
 logging_steps: 1
-# 每多少步做一次评估
 eval_steps: 5
-# 每多少步保存一次 checkpoint
 save_steps: 10
-# 随机种子
+save_total_limit: 3
+
+# ----- 类别权重（处理不均衡） -----
+#   none | inverse | sqrt | log
+class_weight_method: inverse
+
+# ----- 冻结控制（Phase 0 对照） -----
+#   freeze_backbone=true 时只训练分类头，用于判断共享特征是预训练自带还是微调产生
+freeze_backbone: false
+#   冻结底部的 N 层 encoder（0 表示不冻）；freeze_backbone=true 时忽略此项
+freeze_layers: 0
+
+# ----- 其他 -----
 seed: 42
+dataloader_num_workers: 2
+fp16: false          # 混合精度 AMP — 需要 CUDA GPU
+bf16: false          # bfloat16 AMP — 需要 Ampere+ GPU，优先于 fp16

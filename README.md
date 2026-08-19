@@ -61,11 +61,14 @@ streamlit run gui/app.py
 
 ## How It Works
 
-**Training** fine-tunes a HuggingFace PLM (e.g. ESM-2) on a per-residue
+**Training** fine-tunes a HuggingFace PLM on a per-residue
 token-classification task — for example predicting whether each residue is
-*rigid* or *flexible*. A shared **label map** defines how raw dataset
-characters map to class IDs, so Training and Single always interpret a dataset
-identically.
+*rigid* or *flexible*. It supports both native `facebook/esm2_t6_8M_UR50D` and
+`Synthyra/ESM2-8M` (FastPLMs, `trust_remote_code=True` handled automatically),
+logs a `provenance.json`/`config_snapshot.yaml` for reproducibility, and offers
+`freeze_backbone`/`freeze_layers` controls for Phase 0 experiments. A shared
+**label map** defines how raw dataset characters map to class IDs, so Training
+and Single always interpret a dataset identically.
 
 **Single** then opens up the fine-tuned model with **Sparse Autoencoders**.
 An SAE decomposes the PLM's dense hidden states into a sparse, overcomplete set
