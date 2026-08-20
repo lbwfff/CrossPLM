@@ -385,11 +385,6 @@ def compute_feature_activation_profile(
     }
     feature_cache = feature_cache if feature_cache is not None else {}
 
-    valid = (labels != -100).cpu().numpy()
-    # "other" = all valid residues not in the positive class (for activation_gap)
-    if positive_class in class_ids:
-        other_mask = valid & (labels != positive_class)
-
     for feature_list in tqdm(
         split_up_feature_list(n_features, feature_chunk_size),
         desc="Computing activation profiles",
@@ -549,10 +544,11 @@ def align_features_to_concepts(
     if compute_domain_f1:
         n_domains = np.zeros(n_concepts, dtype=np.float64)
         for c in valid_idx:
-            col = labels.getcol(c).toarray().ravel()
+            ic = int(c)
+            col = labels.getcol(ic).toarray().ravel()
             starts, ends, ids = _domain_instance_ranges(col, protein_ids)
-            domain_tables[c] = (starts, ends, ids)
-            n_domains[c] = len(ids)
+            domain_tables[ic] = (starts, ends, ids)
+            n_domains[ic] = len(ids)
 
     thresholds_arr = np.array(thresholds, dtype=np.float32)
 
@@ -593,8 +589,11 @@ def align_features_to_concepts(
         best_fp = np.zeros((f_chunk, n_concepts))
         best_fn = np.zeros((f_chunk, n_concepts))
 
-        # ---- Vectorized threshold scan ----
-        # For each threshold: tp[f, c] = preds[f].T @ labels[c] via one sparse matmul
+        # ---- Vectorized threshold scan (residue-level) ----
+        # P0-1 lazy: first scan all thresholds for residue F1 only (cheap
+        # sparse matmul), record best threshold per (f,c). Domain metrics are
+        # evaluated lazily once per best threshold below, so 5 domain passes
+        # become 1 — exact same result, 4/5 domain work saved.
         for t_idx, t in enumerate(thresholds_arr):
             preds = (feats_np > t).astype(np.float32)  # [n, f_chunk]
             tp = (preds.T @ labels_float).astype(np.float64)  # [f_chunk, c]
@@ -604,18 +603,50 @@ def align_features_to_concepts(
             rec = tp / (tp + fn + 1e-10)
             f1 = 2 * prec * rec / (prec + rec + 1e-10)
 
-            # Domain-level metrics use one-to-one matching between contiguous
-            # predicted activation segments and annotated domain instances.
-            domain_precision = np.zeros((f_chunk, n_concepts))
-            domain_recall = np.zeros((f_chunk, n_concepts))
-            domain_f1 = np.zeros((f_chunk, n_concepts))
-            domain_tp = np.zeros((f_chunk, n_concepts))
-            domain_fp = np.zeros((f_chunk, n_concepts))
-            domain_fn = np.zeros((f_chunk, n_concepts))
-            if compute_domain_f1:
-                # Predicted activation segments for every feature in the chunk.
-                # A segment must stay within one protein (split at protein change)
-                # and cannot span inactive tokens.
+            if fixed is None:
+                allowed = True
+            else:
+                allowed = np.isclose(
+                    float(t), fixed[np.asarray(feature_list), :], atol=1e-6
+                )
+            better = allowed & (f1 > best_f1)
+            best_f1 = np.where(better, f1, best_f1)
+            best_prec = np.where(better, prec, best_prec)
+            best_rec = np.where(better, rec, best_rec)
+            best_thr = np.where(better, t, best_thr)
+            best_thr_idx = np.where(better, t_idx, best_thr_idx)
+            best_tp = np.where(better, tp, best_tp)
+            best_fp = np.where(better, fp, best_fp)
+            best_fn = np.where(better, fn, best_fn)
+
+        # ---- Lazy domain metrics: evaluate once at best threshold per pair ----
+        if compute_domain_f1:
+            # Reconstruct sparse best thresholds from best_thr/best_thr_idx.
+            # For pairs never updated (best_f1 == 0/ -1) we skip domain.
+            # Build a map thr_value -> list of (j,c) needing that threshold so
+            # each distinct threshold is materialised once.
+            from collections import defaultdict
+
+            thr_to_pairs: dict[int, list[tuple[int, int]]] = defaultdict(list)
+            emit_domain_mask = best_f1 > 0
+            if fixed is not None:
+                emit_domain_mask |= np.isfinite(fixed[np.asarray(feature_list), :])
+            # Only valid concepts participate in domain — int-normalised keys
+            for j in range(f_chunk):
+                for c in valid_idx:
+                    ic = int(c)
+                    if not emit_domain_mask[j, ic]:
+                        continue
+                    t_idx_best = int(best_thr_idx[j, ic])
+                    thr_to_pairs[t_idx_best].append((j, ic))
+
+            # Cache segment tables per feature per distinct threshold
+            # to avoid recomputing is_start/is_end for same t across many concepts.
+            seg_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}  # t_idx -> (is_start, is_end)
+            for t_idx_best, pairs in thr_to_pairs.items():
+                t_val = float(thresholds_arr[t_idx_best])
+                # Materialise preds for this threshold once
+                preds = (feats_np > t_val).astype(np.float32)
                 preds_bool = preds > 0  # [n, f_chunk]
                 prev_pred = np.concatenate(
                     [np.zeros((1, f_chunk), dtype=bool), preds_bool[:-1, :]], axis=0
@@ -639,75 +670,86 @@ def align_features_to_concepts(
                     axis=0,
                 )
                 is_end = preds_bool & ~(next_pred & next_same)
-                # Segments depend only on the feature, so compute them once per
-                # feature and reuse across concepts.
-                for j in range(f_chunk):
+
+                # Group pairs by feature so segment extraction is per-feature
+                from collections import defaultdict as _dd
+
+                feat_to_concepts: dict[int, list[int]] = _dd(list)
+                for j, c in pairs:
+                    feat_to_concepts[j].append(c)
+
+                for j, concepts in feat_to_concepts.items():
                     seg_starts = np.flatnonzero(is_start[:, j])
                     if seg_starts.size == 0:
+                        # No predicted segments → domain tp=0, fp=0, fn=n_domains
+                        for c in concepts:
+                            ic = int(c)
+                            if ic not in domain_tables:
+                                continue
+                            starts, ends, ids = domain_tables[ic]
+                            best_domain_tp[j, ic] = 0
+                            best_domain_fp[j, ic] = 0
+                            best_domain_fn[j, ic] = len(ids)
+                            best_domain_precision[j, ic] = 0.0
+                            best_domain_recall[j, ic] = 0.0
+                            best_domain_f1[j, ic] = 0.0
                         continue
                     seg_ends = np.flatnonzero(is_end[:, j]) + 1
-                    for c in valid_idx:
-                        starts, ends, ids = domain_tables[c]
+                    for c in concepts:
+                        ic = int(c)
+                        if ic not in domain_tables:
+                            continue
+                        starts, ends, ids = domain_tables[ic]
                         d_tp, d_fp, d_fn = _domain_confusion_from_segments(
                             seg_starts, seg_ends, starts, ends, ids
                         )
-                        domain_tp[j, c] = d_tp
-                        domain_fp[j, c] = d_fp
-                        domain_fn[j, c] = d_fn
-                for c in valid_idx:
-                    domain_precision[:, c] = domain_tp[:, c] / np.maximum(
-                        domain_tp[:, c] + domain_fp[:, c], 1e-10
-                    )
-                    domain_recall[:, c] = domain_tp[:, c] / np.maximum(
-                        domain_tp[:, c] + domain_fn[:, c], 1e-10
-                    )
-                    domain_f1[:, c] = (
-                        2 * domain_precision[:, c] * domain_recall[:, c]
-                        / np.maximum(domain_precision[:, c] + domain_recall[:, c], 1e-10)
-                    )
-
-            if fixed is None:
-                allowed = True
-            else:
-                allowed = np.isclose(
-                    float(t), fixed[np.asarray(feature_list), :], atol=1e-6
-                )
-            better = allowed & (f1 > best_f1)
-            best_f1 = np.where(better, f1, best_f1)
-            best_prec = np.where(better, prec, best_prec)
-            best_rec = np.where(better, rec, best_rec)
-            best_thr = np.where(better, t, best_thr)
-            best_thr_idx = np.where(better, t_idx, best_thr_idx)
-            best_domain_precision = np.where(
-                better, domain_precision, best_domain_precision
-            )
-            best_domain_recall = np.where(
-                better, domain_recall, best_domain_recall
-            )
-            best_domain_f1 = np.where(better, domain_f1, best_domain_f1)
-            best_tp = np.where(better, tp, best_tp)
-            best_fp = np.where(better, fp, best_fp)
-            best_fn = np.where(better, fn, best_fn)
-            best_domain_tp = np.where(better, domain_tp, best_domain_tp)
-            best_domain_fp = np.where(better, domain_fp, best_domain_fp)
-            best_domain_fn = np.where(better, domain_fn, best_domain_fn)
+                        best_domain_tp[j, ic] = d_tp
+                        best_domain_fp[j, ic] = d_fp
+                        best_domain_fn[j, ic] = d_fn
+                        denom_p = d_tp + d_fp
+                        denom_r = d_tp + d_fn
+                        prec_d = d_tp / denom_p if denom_p else 0.0
+                        rec_d = d_tp / denom_r if denom_r else 0.0
+                        f1_d = (2 * prec_d * rec_d / (prec_d + rec_d)) if (prec_d + rec_d) else 0.0
+                        best_domain_precision[j, ic] = prec_d
+                        best_domain_recall[j, ic] = rec_d
+                        best_domain_f1[j, ic] = f1_d
 
         # ---- Vectorized AUROC (per-feature rank sum) ----
+        # P0-2: rankdata is vectorised over the feature chunk (axis=0) and the
+        # Mann-Whitney rank-sum is computed via a single sparse matmul
+        # labels_float.T @ ranks  (c, n_active) instead of f_chunk serial matmuls.
         if compute_auroc:
-            auroc = np.full((f_chunk, n_concepts), 0.5)
-            for j in range(f_chunk):
-                col = feats_np[:, j]
-                if col.max() == 0:
-                    continue
-                ranks = rankdata(col, method="average")
-                rank_sum_pos = np.asarray(labels_float.T @ ranks).ravel()  # [c]
+            auroc = np.full((f_chunk, n_concepts), 0.5, dtype=np.float64)
+            active_mask = feats_np.max(axis=0) > 0
+            n_active = int(active_mask.sum())
+            if n_active:
+                # (n, n_active) ranks, average method handles ties
+                ranks = rankdata(feats_np[:, active_mask], axis=0, method="average")
+                # Ensure 2-D even when n_active == 1 (rankdata squeezes)
+                if ranks.ndim == 1:
+                    ranks = ranks[:, None]
+                # (c, n_active) rank sums for every concept × active feature
+                rank_sums = np.asarray(labels_float.T @ ranks)
+                if rank_sums.ndim == 1:
+                    rank_sums = rank_sums[:, None]
+                # (c,) denom per concept — use distinct name to avoid shadowing outer valid_idx
                 denom = n_pos * n_neg
-                valid = denom > 0
-                auc = np.full(n_concepts, 0.5)
-                auc[valid] = (rank_sum_pos[valid] - n_pos[valid] * (n_pos[valid] + 1) / 2.0) / denom[valid]
-                auroc[j] = auc
+                auc_valid_idx = np.where(denom > 0)[0]
+                if len(auc_valid_idx):
+                    rs_valid = rank_sums[auc_valid_idx]  # (n_valid, n_active)
+                    np_valid = n_pos[auc_valid_idx, None]  # (n_valid, 1)
+                    nn_valid = n_neg[auc_valid_idx, None]
+                    auc_valid = (rs_valid - np_valid * (np_valid + 1) / 2.0) / (np_valid * nn_valid)
+                    # Scatter back into (n_active, c) layout then into auroc
+                    # rank_sums is (c, n_active) → auc_valid is (n_valid, n_active)
+                    # Need full (c, n_active) with 0.5 elsewhere, then transpose
+                    auc_mat = np.full((n_concepts, n_active), 0.5, dtype=np.float64)
+                    auc_mat[auc_valid_idx] = auc_valid
+                    active_idx = np.where(active_mask)[0]
+                    auroc[active_idx] = auc_mat.T
         else:
-            auroc = np.full((f_chunk, n_concepts), 0.5)
+            auroc = np.full((f_chunk, n_concepts), 0.5, dtype=np.float64)
 
         # ---- Fill results (only for valid concepts with positive F1) ----
         emit_mask = best_f1 > 0

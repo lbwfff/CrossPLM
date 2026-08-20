@@ -37,13 +37,17 @@ The web interface will open in your browser (default: http://localhost:8501).
 
 ### 🔬 Single Module (SAE Pipeline)
 - **Pipeline-oriented**: fill shared settings once (experiment/source/layer/label map/ckpt/csv)
+- `--model_type` toggle: `ft` for fine-tuned `MA/MB` (`checkpoints/best`) vs `base` for `M0` (`facebook`/`Synthyra` Hub ID, central `Outputs/_pretrained/` cache)
 - Tick the steps you want (extract → train SAE → analyze → concepts → fidelity → visualize)
-- Each step only shows its own parameters; paths like `embeddings_dir` are auto-derived
+- Each step only shows its own parameters; paths like `embeddings_dir` are auto-derived with flat fallback (`source` nested → flat)
+- `visualize` supports `--filter_sequence` (single exact protein, shard auto-corrected; default `max_proteins=3`)
 - Warns when a selected step is missing a required value
 - One-click pipeline script download
 
 ### 🔀 Crossing Module
-- Planned for future implementation
+- **Feature Alignment** (Phase 1): `compute_feature_similarity` — activation/cosine, CKA, MI, semantic `S_cross`, controls, heatmap
+- **Cross-task Information** (Phase 2): `cross_task_probe` (2×2 transfer matrix) + `classify_features` (Shared / A-specific / B-specific)
+- Quick-fill from existing `Outputs/<exp>` for SAE/embeddings/concepts; auto-inferred paths shown inline
 
 ## Structure
 
@@ -69,13 +73,19 @@ gui/
 
 2. Training Module
    ├── Fill experiment config (label map auto-fills columns & CSV)
-   ├── Config auto-saved to Outputs/<task>/config.yaml
+   ├── Advanced: grad accum / weight decay / class weights / FP16/BF16 / freeze (Phase 0)
+   ├── Config auto-saved to Outputs/<task>/config.yaml (+ provenance.json)
    └── Get init → train → eval commands
 
 3. Single Module
-   ├── Fill shared pipeline settings once
+   ├── Fill shared pipeline settings once (model_type base for M0 → Outputs/_pretrained/ vs ft for MA/MB)
    ├── Tick desired steps
    └── Get the whole set of SAE analysis commands
+
+4. Crossing Module
+   ├── Quick-fill A/B from existing Outputs/<exp> (SAE/embeddings/concepts)
+   ├── Pick Phase 1 (similarity) / Phase 2 (probe + classification)
+   └── Get cross-model commands
 ```
 
 ## Tips

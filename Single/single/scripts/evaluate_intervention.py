@@ -125,11 +125,15 @@ def evaluate(
         raise ValueError(f"feature_idx {feature_idx} out of range [0, {sae.dict_size})")
 
     print(f"\nLoading data from {sequences_csv}...")
-    from single.data import load_sequences_df, validate_sequence_label_lengths
+    from single.data import load_sequences_df, drop_mismatched_lengths
     df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
                            max_sequences=max_sequences)
+    n_before = len(df)
     df[label_column] = df[label_column].fillna("").astype(str)
-    validate_sequence_label_lengths(df, sequence_column, label_column)
+    df, n_dropped = drop_mismatched_lengths(df, sequence_column, label_column)
+    if n_dropped:
+        print(f"[Filter] Dropped {n_dropped} row(s) with sequence/label length mismatches "
+              f"(kept {len(df)}/{n_before}, matches Training's silent drop).")
     sequences = df[sequence_column].tolist()
     labels = df[label_column].tolist()
     print(f"  {len(sequences)} sequences")

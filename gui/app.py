@@ -75,6 +75,29 @@ def _sanitize_filename(name: str) -> str:
     return name[:64]
 
 
+def _format_pipeline_script(cmds: list[str], names: list[str] | None = None) -> str:
+    """Format a list of shell commands as a readable script with completion echos.
+
+    Each command is followed by an ``echo "✓ Step i: <name> completed"`` so the
+    script is both manually editable and shell-friendly with ``set -e``.
+    """
+    if not cmds:
+        return ""
+    if names is None:
+        names = [f"step {i+1}" for i in range(len(cmds))]
+    # Pad names to cmds length
+    if len(names) < len(cmds):
+        names = list(names) + [f"step {i+1}" for i in range(len(names), len(cmds))]
+    lines: list[str] = ["#!/bin/bash", "set -e", ""]
+    for i, (cmd, name) in enumerate(zip(cmds, names), 1):
+        # Guard blocks (if [ ! -f ... ]; then ...) may contain newlines — keep as is
+        lines.append(cmd)
+        lines.append(f'echo "✓ Step {i}: {name} completed"')
+        lines.append("")
+    lines.append('echo "All steps completed."')
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # GUI config import/export + query_params persistence
 # ---------------------------------------------------------------------------
@@ -710,13 +733,13 @@ def training_module():
                                 value=0.9, key="tr_ratio")
         max_seq_length = st.number_input("Max Sequence Length", value=512, key="tr_maxlen")
     with col2:
-        train_bs = st.number_input("Train Batch Size", value=2, key="tr_bs")
-        train_eval_bs = st.number_input("Val Batch Size", value=2, key="tr_ebs",
+        train_bs = st.number_input("Train Batch Size", value=8, key="tr_bs")
+        train_eval_bs = st.number_input("Val Batch Size", value=8, key="tr_ebs",
                                         help="Batch size for validation during training")
     with col3:
         learning_rate = st.number_input("Learning Rate", value=2e-5, format="%.2e",
                                         key="tr_lr")
-        num_epochs = st.number_input("Training Epochs", value=1, key="tr_epochs")
+        num_epochs = st.number_input("Training Epochs", value=3, key="tr_epochs")
 
     # Advanced training options (provenance & Phase 0 freeze)
     with st.expander("Advanced training options", expanded=False):
@@ -727,6 +750,10 @@ def training_module():
             weight_decay = float(st.number_input("Weight Decay", value=0.01, format="%.3f", key="tr_weight_decay"))
             save_limit = int(st.number_input("Save Total Limit", value=3, min_value=1, key="tr_save_limit",
                                             help="Keep newest N periodic + best-F1 checkpoints"))
+            eval_steps = int(st.number_input("Eval Steps", value=500, min_value=1, key="tr_eval_steps",
+                                            help="Run evaluation every N steps"))
+            save_steps = int(st.number_input("Save Steps", value=1000, min_value=1, key="tr_save_steps",
+                                            help="Save periodic checkpoint every N steps"))
         with c2:
             class_weight = st.selectbox("Class Weight", ["inverse", "none", "sqrt", "log"], index=0, key="tr_class_weight",
                                        help="inverse / sqrt / log / none")
@@ -843,9 +870,9 @@ def training_module():
             "weight_decay": float(weight_decay) if 'weight_decay' in locals() else 0.01,
             "num_train_epochs": int(num_epochs),
             "max_steps": -1,
-            "logging_steps": 1,
-            "eval_steps": 5,
-            "save_steps": 10,
+            "logging_steps": 10,
+            "eval_steps": int(eval_steps) if 'eval_steps' in locals() else 500,
+            "save_steps": int(save_steps) if 'save_steps' in locals() else 1000,
             "save_total_limit": int(save_limit) if 'save_limit' in locals() else 3,
             "class_weight_method": str(class_weight) if 'class_weight' in locals() else "inverse",
             "dataloader_num_workers": int(workers) if 'workers' in locals() else 2,
@@ -876,17 +903,34 @@ def training_module():
 
         st.subheader("🚀 Generated Commands")
 
-        st.markdown("**Step 1: Initialize Task**")
+        # `training init` only scaffolds Outputs/<exp>/config.yaml with defaults
+        # and would overwrite the file we just wrote above. When the GUI already
+        # wrote the desired config, `init` is unnecessary — point the user
+        # directly at `train`. Only suggest `init` when the config did not exist
+        # before (fresh task) and note the ordering hazard.
+        already_exists = os.path.exists(cfg_full)
         init_cmd = f"python crossplm.py training init --task_name {task_name}"
-        st.code(init_cmd, language="bash")
-
-        st.markdown("**Step 2: Train Model**")
         train_cmd = f"python crossplm.py training train --config {cfg_full}"
+
+        if already_exists:
+            st.info(
+                f"`{cfg_full}` already existed and was just overwritten with your GUI settings. "
+                "Do **not** run `training init` after this — it would reset the config to defaults. "
+                "Use `train` directly."
+            )
+        else:
+            st.caption(
+                "`training init` only creates `Outputs/<task>/config.yaml` from the template. "
+                "The GUI already wrote the file above, so you can skip `init` and go straight to `train` "
+                f"(shown for reference: `{init_cmd}`)."
+            )
+
+        st.markdown("**Train Model**")
         st.code(train_cmd, language="bash")
 
         eval_cmd = None
         if do_eval:
-            st.markdown("**Step 3: Evaluate Model**")
+            st.markdown("**Evaluate Model**")
             eval_cmd = (f"python crossplm.py training eval \\\n"
                         f"    --checkpoint Outputs/{task_name}/checkpoints/best \\\n"
                         f"    --csv {st.session_state.tr_eval_csv} \\\n"
@@ -895,15 +939,23 @@ def training_module():
             st.code(eval_cmd, language="bash")
 
         st.subheader("📋 Full Pipeline")
-        pipeline_cmds = [init_cmd, train_cmd]
+        st.caption("Pipeline script guards `init` so it will not overwrite an existing `config.yaml`. Each step reports completion via echo.")
+        _cmds: list[str] = []
+        _names: list[str] = []
+        _init_block = f"if [ ! -f {cfg_full} ]; then\n  {init_cmd}\nfi"
+        _cmds.append(_init_block)
+        _names.append("init (guarded)")
+        _cmds.append(train_cmd)
+        _names.append("train")
         if eval_cmd:
-            pipeline_cmds.append(eval_cmd.replace(" \\\n    ", " "))
-        full_pipeline = " && \\\n".join(pipeline_cmds)
-        st.code(full_pipeline, language="bash")
-
+            _clean_eval = eval_cmd.replace(" \\\n    ", " ")
+            _cmds.append(_clean_eval)
+            _names.append("eval")
+        pipeline_script = _format_pipeline_script(_cmds, _names)
+        st.code(pipeline_script, language="bash")
         st.download_button(
             label="📥 Download Pipeline Script",
-            data=f"#!/bin/bash\nset -e\n\n{full_pipeline}\n",
+            data=pipeline_script + "\n",
             file_name="run_training.sh",
             mime="text/x-shellscript"
         )
@@ -1100,22 +1152,39 @@ def single_module():
         return ["python", "crossplm.py", "single", script] + list(common_cmd)
 
     def show_embeddings(step, key):
-        """Browse or auto-derive the embeddings dir (derived path is hint, not pre-selected)."""
+        """Auto-derive embeddings dir from pipeline settings; override only if needed."""
+        from pathlib import Path as _Path
         default = _embeddings_dir(experiment, source, layer) if experiment else ""
-        # Browser for embeddings dir (directory inside Outputs). The derived path is shown
-        # as a hint (initial=derived) but not as the selected value; user must explicitly pick.
+        if not default:
+            return None
+        # Fallback: if source-nested doesn't exist but flat does, use flat.
+        # This handles the common case where task embeddings were extracted flat
+        # (no --source) but analysis is run with a source for output separation.
+        _default_exists = _Path(default).exists()
+        if source and not _default_exists:
+            _flat = _embeddings_dir(experiment, "", layer)
+            if _flat and _Path(_flat).exists():
+                st.caption(f"Embeddings dir (auto-derived): `{_flat}` (source-nested `{default}` not found, using flat)")
+                default = _flat
+                _default_exists = True
+            else:
+                st.caption(f"Embeddings dir (auto-derived): `{default}`")
+                st.warning(f"⚠️ Embeddings dir not found: `{default}` — check Pipeline Settings or use Override")
+        else:
+            st.caption(f"Embeddings dir (auto-derived): `{default}`")
+            if not _default_exists:
+                st.warning(f"⚠️ Embeddings dir not found: `{default}` — will be created by Extract or check Override")
+        use_override = st.checkbox("Override embeddings dir", key=f"{key}_override",
+                                    help="Check to browse a different embeddings directory than the derived default.")
+        if not use_override:
+            return default
         picked = dir_picker(
-            "Embeddings Dir (optional)", key=key,
+            "Embeddings Dir (override)", key=key,
             root="Outputs",
-            help="Browse to the embeddings directory (e.g. Outputs/<exp>/embeddings/layer_6). "
-                 f"Leave blank to use the derived default `{default}`." if default else
-                 "Browse to the embeddings directory.",
-            initial="",
+            help="Browse to a different embeddings directory (e.g. Outputs/<exp>/embeddings/layer_6).",
+            initial=default,
         )
-        # If user explicitly browsed something, use it; otherwise use the derived default
-        if picked:
-            return picked
-        return default or None
+        return picked or default
 
     # --- 1. Extract Embeddings ---
     if selected["extract"]:
@@ -1192,6 +1261,13 @@ def single_module():
             params["analyze_features"] += ["--label_map", label_map, "--n_top_features", str(n_top)]
             params["analyze_features"] += ["--activation_threshold", str(act_thresh)]
 
+    # Concept build capture for auto extract (source-aware)
+    _cb_annotations_tsv = None
+    _cb_n_shards = 5
+    _cb_max_residues = 510
+    _cb_min_seq_len = 0
+    _cb_max_seq_len = 10000
+
     # --- 4a. Concepts build ---
     if selected["concepts_build"]:
         with st.expander("4a. Build Concept Matrices", expanded=True):
@@ -1210,37 +1286,104 @@ def single_module():
             with c3:
                 min_seq_len = int(st.number_input("Min Seq Len", value=0, key="si_cb_min"))
             max_seq_len = int(st.number_input("Max Seq Len", value=10000, key="si_cb_max"))
-            params["concepts_build"] = base_cmd("analyze_concepts") + ["build"]
+            # Subcommand must come directly after `analyze_concepts` — argparse treats
+            # `--experiment` before the subcommand as an invalid choice for `command`.
+            params["concepts_build"] = ["python", "crossplm.py", "single", "analyze_concepts", "build"] + list(common_cmd)
             params["concepts_build"] += ["--annotations_tsv", annotations_tsv] if annotations_tsv else []
             params["concepts_build"] += ["--n_shards", str(n_shards), "--max_residues", str(max_residues)]
             params["concepts_build"] += ["--min_seq_len", str(min_seq_len), "--max_seq_len", str(max_seq_len)]
+            # Capture for auto concept-embeddings extraction
+            _cb_annotations_tsv = annotations_tsv
+            _cb_n_shards = int(n_shards)
+            _cb_max_residues = int(max_residues)
+            _cb_min_seq_len = int(min_seq_len)
+            _cb_max_seq_len = int(max_seq_len)
+
+    # Auto concept-embeddings: when Build is selected, auto generate a concept-specific
+    # extract_embeddings that shares the SAME TSV + shard/seq filters as Build.
+    # Align / Heldout then point at that dir, not at the task mBMRB embeddings.
+    # Policy: source有值时为 f"{source}_concepts"，空值时为 concepts
+    _concepts_source = f"{source}_concepts" if source else "concepts"
+    _concepts_emb_dir = _embeddings_dir(experiment, _concepts_source, layer) if experiment else ""
+    # max_residues is per-protein truncation; extract uses max_length = max_residues + 2 (BOS/EOS)
+    _concept_max_length = int(_cb_max_residues) + 2 if isinstance(_cb_max_residues, int) else 512
+    if selected["concepts_build"]:
+        # Inject an auto step: extract concept embeddings from the SAME annotations_tsv
+        # with identical sharding and truncation, Sequence column auto-filled.
+        if _cb_annotations_tsv and experiment and ckpt_path:
+            auto_extract = base_cmd("extract_embeddings")
+            # override experiment/source for concepts, inject TSV + inferred columns
+            auto_extract = ["python", "crossplm.py", "single", "extract_embeddings",
+                           "--experiment", experiment,
+                           "--source", _concepts_source,
+                           "--ckpt_path", ckpt_path,
+                           "--sequences_csv", _cb_annotations_tsv,
+                           "--sequence_column", "Sequence",
+                           "--layer", str(layer),
+                           "--label_map", label_map,
+                           "--max_length", str(_concept_max_length),
+                           "--n_shards", str(_cb_n_shards),
+                           "--min_seq_len", str(_cb_min_seq_len),
+                           "--max_seq_len", str(_cb_max_seq_len)]
+            # Keep batch_size consistent with Pipeline Settings default; user can re-run manually
+            # with a different batch if needed — not exposed here to avoid extra UI clutter.
+            params["extract_concepts"] = auto_extract
+        else:
+            # Missing ckpt or experiment: still note what will be auto-generated once filled
+            pass
 
     # --- 4b. Concepts align ---
     if selected["concepts_align"]:
         with st.expander("4b. Align Features to Concepts", expanded=True):
-            emb = show_embeddings("concepts_align", "si_ca_emb")
+            # Concept embeddings are auto-derived from Build — override optional
+            st.caption(f"Embeddings (auto-derived from Build): `{_concepts_emb_dir}` — same TSV + shards as `4a Build`")
+            _ca_override = st.checkbox("Override concept embeddings dir", key="si_ca_emb_override",
+                                        help="Check to browse a different embeddings directory than the auto-derived concept embeddings.")
+            if _ca_override:
+                _ca_picked = dir_picker("Embeddings Dir (override)", key="si_ca_emb",
+                                         root="Outputs",
+                                         help="Browse to a different embeddings directory (e.g. Outputs/<exp>/embeddings/layer_6).",
+                                         initial=_concepts_emb_dir or "")
+                _ca_emb = _ca_picked or _concepts_emb_dir
+            else:
+                _ca_emb = _concepts_emb_dir
             thresh = st.text_input("Threshold Percents (space-separated)", value="0 0.15 0.5 0.6 0.8",
                                    key="si_ca_thr")
-            params["concepts_align"] = base_cmd("analyze_concepts") + ["align"]
-            params["concepts_align"] += ["--embeddings_dir", emb] if emb else []
+            params["concepts_align"] = ["python", "crossplm.py", "single", "analyze_concepts", "align"] + list(common_cmd)
+            # Align consumes the concept-specific embeddings, not the task mBMRB embeddings
+            params["concepts_align"] += ["--embeddings_dir", _ca_emb] if _ca_emb else []
             if thresh.strip():
                 params["concepts_align"] += ["--threshold_percents"] + thresh.split()
+            if not ckpt_path and selected["concepts_build"]:
+                st.warning("Auto concept-extract needs a Checkpoint Path (Pipeline Settings) to generate embeddings.")
 
     # --- 4c. Concepts heldout ---
     if selected["concepts_heldout"]:
         with st.expander("4c. Held-out Validation", expanded=True):
-            emb = show_embeddings("concepts_heldout", "si_ch_emb")
+            st.caption(f"Embeddings (auto-derived from Build): `{_concepts_emb_dir}` — same TSV + shards as `4a Build`")
+            _ch_override = st.checkbox("Override concept embeddings dir", key="si_ch_emb_override",
+                                        help="Check to browse a different embeddings directory than the auto-derived concept embeddings.")
+            if _ch_override:
+                _ch_picked = dir_picker("Embeddings Dir (override)", key="si_ch_emb",
+                                         root="Outputs",
+                                         help="Browse to a different embeddings directory.",
+                                         initial=_concepts_emb_dir or "")
+                _ch_emb = _ch_picked or _concepts_emb_dir
+            else:
+                _ch_emb = _concepts_emb_dir
             split_mode = st.selectbox("Split Mode", ["half", "alternate"], key="si_ch_split")
             thresh = st.text_input("Threshold Percents (space-separated)", value="0 0.15 0.5 0.6 0.8",
                                    key="si_ch_thr")
             f1_thresh = float(st.number_input("Held-out F1 Threshold", value=0.3, format="%.2f",
                                               key="si_ch_f1"))
-            params["concepts_heldout"] = base_cmd("analyze_concepts") + ["heldout"]
-            params["concepts_heldout"] += ["--embeddings_dir", emb] if emb else []
+            params["concepts_heldout"] = ["python", "crossplm.py", "single", "analyze_concepts", "heldout"] + list(common_cmd)
+            params["concepts_heldout"] += ["--embeddings_dir", _ch_emb] if _ch_emb else []
             params["concepts_heldout"] += ["--split_mode", split_mode]
             params["concepts_heldout"] += ["--heldout_f1_threshold", str(f1_thresh)]
             if thresh.strip():
                 params["concepts_heldout"] += ["--threshold_percents"] + thresh.split()
+            if not ckpt_path and selected["concepts_build"]:
+                st.warning("Auto concept-extract needs a Checkpoint Path (Pipeline Settings) to generate embeddings.")
 
     # --- 5. Analyze Sequence ---
     if selected["analyze_sequence"]:
@@ -1248,17 +1391,19 @@ def single_module():
             emb = show_embeddings("analyze_sequence", "si_as_emb")
             c1, c2 = st.columns(2)
             with c1:
-                feat_indices = st.text_input("Feature Indices *", key="si_as_feat",
-                                             help="Space-separated, e.g. '375 42'")
+                feat_indices = st.text_input("Feature Indices *", value="42 234", key="si_as_feat",
+                                             help="Space-separated, e.g. '375 42' (required)")
             with c2:
                 flank = int(st.number_input("Flank", value=5, key="si_as_flank"))
-            params["analyze_sequence"] = base_cmd("analyze_sequence")
-            params["analyze_sequence"] += ["--embeddings_dir", emb] if emb else []
-            params["analyze_sequence"] += ["--sequences_csv", sequences_csv] if sequences_csv else []
-            params["analyze_sequence"] += ["--label_map", label_map]
-            if feat_indices.strip():
+            if not feat_indices.strip():
+                st.warning("⚠️ Analyze Sequence needs Feature Indices (e.g. '42 234').")
+            else:
+                params["analyze_sequence"] = base_cmd("analyze_sequence")
+                params["analyze_sequence"] += ["--embeddings_dir", emb] if emb else []
+                params["analyze_sequence"] += ["--sequences_csv", sequences_csv] if sequences_csv else []
+                params["analyze_sequence"] += ["--label_map", label_map]
                 params["analyze_sequence"] += ["--feature_indices"] + feat_indices.split()
-            params["analyze_sequence"] += ["--flank", str(flank)]
+                params["analyze_sequence"] += ["--flank", str(flank)]
 
     # --- 6. Analyze Co-activation ---
     if selected["analyze_coactivation"]:
@@ -1331,13 +1476,23 @@ def single_module():
                                              help="Empty = auto-select top features.")
             with c2:
                 n_features = int(st.number_input("N Features", value=10, key="si_viz_n"))
-            shard = int(st.number_input("Shard", value=0, key="si_viz_shard"))
+            c1, c2 = st.columns(2)
+            with c1:
+                shard = int(st.number_input("Shard", value=0, key="si_viz_shard"))
+            with c2:
+                filter_seq = st.text_input("Filter Sequence (optional)", key="si_viz_filter_seq",
+                                           help="Exact protein sequence to visualize (single sequence, case-insensitive). "
+                                                "When given, only that protein is visualized and --shard is auto-corrected. Leave empty for default 3 proteins.",
+                                           placeholder="e.g. MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDNPLDAELLA")
             params["visualize"] = base_cmd("visualize_features")
             params["visualize"] += ["--sequences_csv", sequences_csv] if sequences_csv else []
             params["visualize"] += ["--layer", str(layer), "--label_map", label_map]
             params["visualize"] += ["--shard", str(shard), "--n_features", str(n_features)]
             if feat_indices.strip():
                 params["visualize"] += ["--feature_indices"] + feat_indices.split()
+            if filter_seq.strip():
+                # Pass as a single quoted arg (sequence may be long, no spaces)
+                params["visualize"] += ["--filter_sequence", filter_seq.strip()]
 
     # ------------------------------------------------------------------ #
     # Generate commands
@@ -1346,6 +1501,7 @@ def single_module():
     st.subheader("🚀 Generated Commands")
 
     ordered_keys = ["extract", "train_sae", "analyze_features", "concepts_build",
+                    "extract_concepts",
                     "concepts_align", "concepts_heldout", "analyze_sequence",
                     "analyze_coactivation", "fidelity", "intervention", "visualize"]
 
@@ -1382,11 +1538,27 @@ def single_module():
 
     if generated:
         st.subheader("📋 Full Pipeline")
-        full_pipeline = " && \\\n".join(generated)
-        st.code(full_pipeline, language="bash")
+        _name_map = {
+            "extract": "extract_embeddings",
+            "train_sae": "train_sae",
+            "analyze_features": "analyze_features",
+            "concepts_build": "analyze_concepts build",
+            "extract_concepts": "extract_concepts (auto)",
+            "concepts_align": "analyze_concepts align",
+            "concepts_heldout": "analyze_concepts heldout",
+            "analyze_sequence": "analyze_sequence",
+            "analyze_coactivation": "analyze_coactivation",
+            "fidelity": "evaluate_fidelity",
+            "intervention": "evaluate_intervention",
+            "visualize": "visualize_features",
+        }
+        _ordered_valid_keys = [k for k in ordered_keys if k in valid]
+        _names = [_name_map.get(k, k) for k in _ordered_valid_keys]
+        pipeline_script = _format_pipeline_script(generated, _names)
+        st.code(pipeline_script, language="bash")
         st.download_button(
             label="📥 Download Pipeline Script",
-            data=f"#!/bin/bash\nset -e\n\n{full_pipeline}\n",
+            data=pipeline_script + "\n",
             file_name="run_single.sh",
             mime="text/x-shellscript"
         )
@@ -1694,13 +1866,21 @@ def crossing_module():
 
     if cmds:
         st.subheader("📋 Full Pipeline")
-        full = " && \\\n".join(cmds)
-        st.code(full, language="bash")
+        # Map cmds order to readable names for echo
+        _cr_names: list[str] = []
+        if sel_sim:
+            _cr_names.append("compute_feature_similarity")
+        if sel_probe:
+            _cr_names.append("cross_task_probe")
+        if sel_class:
+            _cr_names.append("classify_features")
+        pipeline_script = _format_pipeline_script(cmds, _cr_names)
+        st.code(pipeline_script, language="bash")
         st.download_button(
             label="📥 Download Pipeline Script",
-            data=f"#!/bin/bash\nset -e\n\n{full}\n",
+            data=pipeline_script + "\n",
             file_name="run_crossing.sh",
-            mime="text/x-shellscript",
+            mime="text/x-shellscript"
         )
 
 

@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForTokenClassification, AutoTokenizer
+from transformers import AutoModel, AutoModelForMaskedLM, AutoModelForTokenClassification, AutoTokenizer
 
 
 def _residue_positions(batch_encoding, tokenizer, sequences):
@@ -16,14 +16,24 @@ def _residue_positions(batch_encoding, tokenizer, sequences):
             [int(token_id in special_ids) for token_id in row]
             for row in batch_encoding["input_ids"].tolist()
         ])
+    else:
+        # Ensure tensor for consistent masking
+        if not isinstance(special, torch.Tensor):
+            special = torch.tensor(special)
     attention = batch_encoding["attention_mask"]
+    if not isinstance(attention, torch.Tensor):
+        attention = torch.tensor(attention)
     positions = []
     for index, sequence in enumerate(sequences):
         residue = torch.nonzero(
             (attention[index] == 1) & (special[index] == 0)
         ).flatten()
+        # Padding tokens may be marked as special (ESM pad=1) — count only the
+        # specials that are actually attended (i.e. BOS/EOS), otherwise a padded
+        # batch underestimates the expected residue count (e.g. 142 vs 136).
+        n_special_real = int(((special[index] == 1) & (attention[index] == 1)).sum().item())
         expected = min(
-            len(sequence), int(attention[index].sum().item()) - int(special[index].sum().item())
+            len(sequence), int(attention[index].sum().item()) - n_special_real
         )
         if len(residue) != expected:
             raise ValueError(
@@ -36,11 +46,21 @@ def _residue_positions(batch_encoding, tokenizer, sequences):
 
 class FineTunedESMEmbedder:
     """
-    Extracts hidden states from a fine-tuned ESM2-8M model for SAE training.
+    Extracts hidden states from an ESM model for SAE training.
 
-    Unlike InterPLM which uses the base ESM, this embedder loads the fine-tuned
-    checkpoint and extracts intermediate layer activations from the backbone,
-    bypassing the classification head.
+    Parameters
+    ----------
+    ckpt_path : str | Path
+        Hub ID (e.g. ``facebook/esm2_t6_8M_UR50D``) for the base ``M0`` or a
+        local ``Outputs/<exp>/checkpoints/best`` directory for a fine-tuned
+        ``MA`` / ``MB``.
+    model_type : str
+        ``"ft"`` (default) loads ``AutoModelForTokenClassification`` — the
+        fine-tuned checkpoint. ``"base"`` loads ``AutoModel`` (encoder only)
+        for the pre-trained ``M0`` — required for ``Phase 0.1`` so that the
+        SAE is not tied to a task head. ``"base"`` is compatible with both
+        native ``facebook/esm2_*`` and ``Synthyra/ESM2-8M`` (``trust_remote_code``
+        is handled automatically and ``local_files_only`` is inferred).
     """
 
     def __init__(
@@ -49,10 +69,17 @@ class FineTunedESMEmbedder:
         model_name: str = "Synthyra/ESM2-8M",
         device: Optional[str] = None,
         max_length: int = 512,
+        model_type: str = "ft",
     ):
-        self.ckpt_path = Path(ckpt_path)
+        # ckpt_path may be a Hub ID (contains "/" and no local file) or a
+        # local directory. Keep it as a string for the Hub case so
+        # ``Path("facebook/esm2...")`` does not mis-classify it as a local path.
+        self.ckpt_path = ckpt_path
         self.model_name = model_name
         self.max_length = max_length
+        self.model_type = str(model_type).lower()
+        if self.model_type not in ("ft", "base"):
+            raise ValueError("model_type must be 'ft' or 'base'")
 
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -61,20 +88,42 @@ class FineTunedESMEmbedder:
 
         self._load_model()
 
+    def _is_local_path(self, path: Union[str, Path]) -> bool:
+        p = Path(path)
+        return p.exists() and p.is_dir()
+
     def _load_model(self):
-        # The fine-tuned backbones (e.g. Synthyra/ESM2-8M via FastPLMs) ship custom
-        # code in config.json (auto_map), so trust_remote_code=True is required.
+        # Locate tokenizer/model: local checkpoint (fine-tuned) → local_files_only,
+        # Hub ID (base M0, e.g. facebook/esm2_t6_8M_UR50D) → allow remote fetch.
+        is_local = self._is_local_path(self.ckpt_path)
+        # Synthyra / FastPLMs ships custom code via auto_map; native ESM does not
+        # need it but passing True is harmless for both families.
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.ckpt_path, local_files_only=True, trust_remote_code=True
+            str(self.ckpt_path), local_files_only=is_local, trust_remote_code=True
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token or "<pad>"
         if getattr(self.tokenizer, "padding_side", "right") != "right":
             raise ValueError("Embedding extraction requires tokenizer.padding_side='right'")
 
-        self.model = AutoModelForTokenClassification.from_pretrained(
-            self.ckpt_path, local_files_only=True, trust_remote_code=True
-        )
+        if self.model_type == "base":
+            # Encoder only (no classification head) — works for both native EsmModel
+            # (has .encoder) and FastEsmModel (has .esm.encoder).
+            # Prefer the generic encoder-only checkpoint; masked-LM weights are
+            # strictly a superset but produce UNEXPECTED warnings on pooler.
+            try:
+                self.model = AutoModel.from_pretrained(
+                    str(self.ckpt_path), local_files_only=is_local, trust_remote_code=True
+                )
+            except Exception:
+                # Fallback for Hub IDs that only ship a masked-LM artefact
+                self.model = AutoModelForMaskedLM.from_pretrained(
+                    str(self.ckpt_path), local_files_only=is_local, trust_remote_code=True
+                )
+        else:
+            self.model = AutoModelForTokenClassification.from_pretrained(
+                str(self.ckpt_path), local_files_only=is_local, trust_remote_code=True
+            )
         self.model = self.model.to(self.device)
         self.model.eval()
 
@@ -82,10 +131,22 @@ class FineTunedESMEmbedder:
         self.num_layers = self.model.config.num_hidden_layers
 
     def _forward_target_layer(self, inputs, layer: int, need_logits: bool):
-        """Run the model while retaining only the requested final hidden layer."""
-        final_layer = getattr(self.model, "esm", None)
-        if final_layer is not None:
-            final_layer = getattr(final_layer.encoder, "emb_layer_norm_after", None)
+        """Run the model while retaining only the requested final hidden layer.
+
+        For ``model_type="ft"`` the final layer is captured via a forward hook on
+        ``emb_layer_norm_after`` to avoid materialising all hidden states; for
+        other layers or for ``model_type="base"`` (no classifier) the regular
+        ``output_hidden_states`` path is used.  The encoder location differs
+        between native ESM (``encoder``) and FastESM (``esm.encoder``), so both
+        are probed.
+        """
+        # Locate the final layernorm for the hook path (only for the last layer)
+        final_layer = None
+        if layer == self.num_layers:
+            if hasattr(self.model, "esm") and hasattr(self.model.esm, "encoder"):
+                final_layer = getattr(self.model.esm.encoder, "emb_layer_norm_after", None)
+            elif hasattr(self.model, "encoder"):
+                final_layer = getattr(self.model.encoder, "emb_layer_norm_after", None)
         if layer == self.num_layers and final_layer is not None:
             captured = {}
 
@@ -106,8 +167,10 @@ class FineTunedESMEmbedder:
             outputs = self.model(
                 **inputs, output_hidden_states=True, return_dict=True
             )
+            # ``hidden_states`` exists for both AutoModel and ForTokenClassification
             hidden = outputs.hidden_states[layer]
-        logits = outputs.logits if need_logits else None
+        # Base models (AutoModel) have no classification head → no logits
+        logits = getattr(outputs, "logits", None) if need_logits else None
         return hidden, logits
 
     def residue_lengths(self, sequences: List[str], batch_size: int = 8) -> List[int]:

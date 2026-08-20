@@ -334,9 +334,18 @@ def file_picker(
     cwd_key = key + "_cwd"
     sel_key = key + "_selected"
     manual_key = key + "_manual"
+    pending_manual_key = key + "_pending_manual"
+    # Apply deferred manual sync before widget instantiation (avoids StreamlitAPIException
+    # "cannot be modified after the widget with key ... is instantiated").
+    if pending_manual_key in st.session_state:
+        st.session_state[manual_key] = st.session_state.pop(pending_manual_key)
     show_key = key + "_show_browser"
     page_key = key + "_page"
     filter_key = key + "_filter"
+    pending_filter_key = key + "_pending_filter"
+    # Defer filter clear until before widget instantiation as well
+    if pending_filter_key in st.session_state:
+        st.session_state[filter_key] = st.session_state.pop(pending_filter_key)
     cwd = Path(st.session_state[cwd_key])
 
     # Clamp cwd to within root
@@ -365,9 +374,8 @@ def file_picker(
             st.session_state[sel_key] = ""
             st.session_state[show_key] = True  # re-expand so user can pick again
             st.session_state[page_key] = 0
-            # Keep manual widget in sync (it otherwise retains the old string)
-            if manual_key in st.session_state:
-                st.session_state[manual_key] = ""
+            # Defer manual sync to next run (cannot modify after instantiation)
+            st.session_state[pending_manual_key] = ""
             st.rerun()
 
     # Manual path input (fallback for power users / copy-paste)
@@ -454,7 +462,7 @@ def file_picker(
                     if st.button(f"📁 {d.name}/", key=_entry_key(key + "_dir", d, cwd), use_container_width=True):
                         st.session_state[cwd_key] = str(d.resolve())
                         st.session_state[page_key] = 0
-                        st.session_state[filter_key] = ""  # clear filter on navigation
+                        st.session_state[pending_filter_key] = ""  # defer clear until before widget instantiation
                         st.rerun()
             if filter_q and not f_dirs and dirs:
                 st.caption(f"_No dirs matching `{filter_q}`_")
@@ -493,8 +501,8 @@ def file_picker(
                     st.session_state[sel_key] = rel
                     st.session_state[show_key] = False  # auto-collapse after selection
                     st.session_state[page_key] = 0
-                    # Keep manual widget in sync
-                    st.session_state[manual_key] = rel
+                    # Defer manual sync to next run
+                    st.session_state[pending_manual_key] = rel
                     st.rerun()
 
             # Pagination controls (bottom, for long pages)
@@ -531,9 +539,15 @@ def dir_picker(
     cwd_key = key + "_cwd"
     sel_key = key + "_selected"
     manual_key = key + "_manual"
+    pending_manual_key = key + "_pending_manual"
+    if pending_manual_key in st.session_state:
+        st.session_state[manual_key] = st.session_state.pop(pending_manual_key)
     show_key = key + "_show_browser"
     page_key = key + "_page_dir"
     filter_key = key + "_filter_dir"
+    pending_filter_key = key + "_pending_filter_dir"
+    if pending_filter_key in st.session_state:
+        st.session_state[filter_key] = st.session_state.pop(pending_filter_key)
     cwd = Path(st.session_state[cwd_key])
 
     try:
@@ -560,8 +574,7 @@ def dir_picker(
             st.session_state[sel_key] = ""
             st.session_state[show_key] = True
             st.session_state[page_key] = 0
-            if manual_key in st.session_state:
-                st.session_state[manual_key] = ""
+            st.session_state[pending_manual_key] = ""
             st.rerun()
 
     # Manual input + select current button
@@ -583,8 +596,7 @@ def dir_picker(
         if st.button("Use current", key=key + "_use_current", use_container_width=True, help="Select the currently browsed directory"):
             st.session_state[sel_key] = _to_repo_rel(cwd)
             st.session_state[show_key] = False  # auto-collapse after selection
-            if manual_key in st.session_state:
-                st.session_state[manual_key] = _to_repo_rel(cwd)
+            st.session_state[pending_manual_key] = _to_repo_rel(cwd)
             st.rerun()
 
     if show_key not in st.session_state:
@@ -653,14 +665,13 @@ def dir_picker(
                     if st.button(label_text, key=_entry_key(key + "_dir_nav", d, cwd), use_container_width=True):
                         st.session_state[cwd_key] = str(d.resolve())
                         st.session_state[page_key] = 0
-                        st.session_state[filter_key] = ""
+                        st.session_state[pending_filter_key] = ""
                         st.rerun()
                 with c2:
                     if st.button("Select", key=_entry_key(key + "_dir_sel", d, cwd), use_container_width=True, disabled=is_selected):
                         st.session_state[sel_key] = _to_repo_rel(d)
                         st.session_state[show_key] = False  # auto-collapse after selection
-                        if manual_key in st.session_state:
-                            st.session_state[manual_key] = _to_repo_rel(d)
+                        st.session_state[pending_manual_key] = _to_repo_rel(d)
                         st.rerun()
 
             if total_pages > 1:

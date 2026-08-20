@@ -75,12 +75,17 @@ def analyze(
 ):
     from single.paths import resolve_experiment
 
-    # If a label map is given, use its sequence_column unless explicitly set.
+    # If a label map is given, use its sequence_column/label_column unless explicitly set.
+    label_column_for_drop = None
     if label_map:
         from single.label_maps import get_label_map, resolve_columns
-        sequence_column, _ = resolve_columns(
+        sequence_column, label_column_resolved = resolve_columns(
             get_label_map(label_map), sequence_column, None
         )
+        label_column_for_drop = label_column_resolved
+    elif "label" in str(sequences_csv):
+        # Fallback: if no label_map but CSV likely has a 'label' column, use it for dropping
+        label_column_for_drop = "label"
 
     # --sae_dir and --output_dir default into Outputs/<experiment>/.
     exp = None
@@ -127,10 +132,12 @@ def analyze(
         shard_ids = [shard]
 
     # Rebuild token -> (protein, residue) mappings for all selected shards.
+    # Must mirror extract_embeddings's drop_mismatched_lengths so shard composition matches residues.csv
     print(f"\nRebuilding protein/residue mapping from {sequences_csv}...")
     shards, shard_proteins, shard_respos = build_residue_positions(
         sequences_csv, shard_ids, n_shards=n_shards, max_residues=max_residues,
         sequence_column=sequence_column,
+        label_column=label_column_for_drop,
         min_seq_len=min_seq_len, max_seq_len=max_seq_len,
         max_sequences=max_sequences,
     )

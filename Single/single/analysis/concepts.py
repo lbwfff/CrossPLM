@@ -315,6 +315,9 @@ def expand_annotations_to_residues(
     # of 1e6 is ample and keeps values well within int32 range even for 1000s of
     # proteins (max ~1e6 * 2000 = 2e9). Using int64 throughout for safety.
     _OFFSET_STRIDE = 1_000_000
+    # Build concept columns via single concat to avoid DataFrame fragmentation
+    # (946 concepts → 946 insert calls triggers PerformanceWarning).
+    concept_frames = {}
     for concept_name, concept_lists in new_columns.items():
         flattened = []
         for i, concept_list in enumerate(concept_lists):
@@ -323,7 +326,9 @@ def expand_annotations_to_residues(
                 (offset + v) if v > 0 else 0
                 for v in concept_list
             )
-        result[concept_name] = flattened
+        concept_frames[concept_name] = flattened
+    if concept_frames:
+        result = pd.concat([result, pd.DataFrame(concept_frames)], axis=1)
 
     concept_columns = [
         c for c in result.columns

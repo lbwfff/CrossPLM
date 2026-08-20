@@ -176,7 +176,7 @@ recommended for older checkpoints.
 | Feature | Description |
 |---------|-------------|
 | **Two-phase workflow** | init (template) → train, keeping config separate from code |
-| **CSV input** | `sequence` + `label` columns, automatic train/eval split |
+| **CSV input** | `sequence` + `label` columns, automatic train/eval split; rows with `len(seq)!=len(label)` are dropped (counts reported, `mBMRB` `9786→9554`) |
 | **Ignore positions** | Unmapped characters excluded from loss (`-100`) |
 | **Auto class weights** | `inverse` / `sqrt` / `log` / `none` strategies |
 | **Configurable label maps** | Presets or YAML, shared with Single |

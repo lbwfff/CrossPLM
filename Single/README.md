@@ -1,9 +1,8 @@
 # Single Module — SAE Interpretability
 
-After fine-tuning a PLM (see the [Training module](../Training/README.md)),
-use **Sparse Autoencoders (SAEs)** to discover which hidden-state features drive
-the model's predictions, and interpret them against either the task labels or
-Swiss-Prot biological concepts.
+After fine-tuning a PLM (see the [Training module](../Training/README.md)) — or directly from the pre-trained `M0` (`facebook/esm2_t6_8M_UR50D` / `Synthyra/ESM2-8M`, `trust_remote_code=True` handled) for the `Phase 0` baseline — use **Sparse Autoencoders (SAEs)** to discover which hidden-state features drive the model's predictions, and interpret them against either the task labels or Swiss-Prot biological concepts.
+
+> **M0 baseline** (`Crossing/ROADMAP.md: Phase 0.1/0.2`): extract with `--model_type base --ckpt_path <hub-id>` (e.g. `facebook/esm2_t6_8M_UR50D`). The weights are cached once in `Outputs/_pretrained/<hub-slug>/` so `MA`/`MB` sharing the same backbone do not duplicate `M0`. See `Shared Conventions` below.
 
 > Back to [project README](../README.md).
 
@@ -67,18 +66,20 @@ without overwriting each other. Without `--source`, everything lives flat under
 and reused across sources.
 
 ```
-Outputs/<experiment>/
-    sae/model.pt            # ONE shared SAE (reused across sources)
-    sae/model_normalized.pt # per-feature max-activation rescale (see below)
-    <source>/               # e.g. mbmrb | swissprot  (--source <id>)
-        embeddings/layer_<N>/shard_<i>/embeddings.pt
-        concepts/shard_<i>/concept_matrix.npz
-        analysis/*.csv|*.json|visualizations/
+Outputs/
+├── _pretrained/<hub-slug>/   # ONE central copy of the raw M0 weights per backbone
+│   ├── config.json / model.safetensors / tokenizer_config.json / vocab.txt
+│   └── m0_provenance.json
+└── <experiment>/
+    ├── sae/model.pt            # ONE shared SAE (reused across sources)
+    ├── sae/model_normalized.pt # per-feature max-activation rescale (see below)
+    └── <source>/               # e.g. mbmrb | swissprot  (--source <id>)
+        ├── embeddings/layer_<N>/shard_<i>/embeddings.pt
+        ├── concepts/shard_<i>/concept_matrix.npz
+        └── analysis/*.csv|*.json|visualizations/
 ```
 
-`single/paths.py` centralizes these paths. `--sae_dir` / `--embeddings_dir` /
-`--output_dir` / `--concepts_dir` default into the experiment dir and can be
-overridden; `--exp_dir <path>` points at an existing dir verbatim.
+`single/paths.py` centralizes `Outputs/<experiment>/` paths; `--sae_dir` / `--embeddings_dir` / `--output_dir` / `--concepts_dir` default into the experiment dir and can be overridden; `--exp_dir <path>` points at an existing dir verbatim. `--model_type base` (M0) vs `ft` (fine-tuned) controls whether `ckpt_path` is a Hub ID or a local `checkpoints/best`.
 
 ### Feature normalization
 
@@ -99,6 +100,8 @@ during `extract_embeddings`, pass the **same values** here too — otherwise
 tokens misalign and the script **fails loudly** instead of producing garbage.
 `--max_sequences N` draws a deterministic subset (fixed seed, reproducible).
 
+Rows where `len(sequence) != len(label)` are **dropped** (with a `[Filter]` count) to match `Training`'s silent drop (`mBMRB.csv` `9786→9554`); the count is written to `embeddings/layer_N/metadata.json` (`n_dropped_mismatched`).
+
 ### Label maps
 
 Label encoding is not hardcoded to mBMRB. Every script accepts
@@ -111,10 +114,11 @@ preset table and YAML format.
 ## 1. Task-Label Alignment
 
 Align each SAE feature with the task labels (e.g. rigid/flexible) to find
-"flexibility detectors".
+"flexibility detectors". This step requires a fine-tuned checkpoint (`--model_type ft`, the default); for the `M0` baseline skip task alignment and go to concepts (`§2`), evaluated by `L0` (recon/`L0`/`dead_pct` from `train_sae`) + `L1` (concept F1).
 
 ```bash
 # Extract hidden states from the fine-tuned model (creates Outputs/demo/mbmrb/)
+# For M0 use: --ckpt_path facebook/esm2_t6_8M_UR50D --model_type base
 python crossplm.py single extract_embeddings \
     --ckpt_path Outputs/my_task/checkpoints/best \
     --sequences_csv Dataset/mBMRB.csv \
@@ -385,11 +389,18 @@ python crossplm.py single visualize_features \
     --experiment demo --source mbmrb \
     --sequences_csv Dataset/mBMRB.csv \
     --feature_indices 234 426 --label_map mBMRB
+# Single protein (exact sequence, shard auto-corrected):
+python crossplm.py single visualize_features \
+    --experiment demo --source mbmrb \
+    --sequences_csv Dataset/mBMRB.csv \
+    --feature_indices 234 --filter_sequence GSIPCLLSPWSEWSDCSVTCGKGMRTRQRMLKSLAELGDCNEDLEQAEKCMLPECP
 ```
 
 `--embeddings_path` and `--output_dir` are inferred from `--experiment` /
 `--layer` / `--shard`. Leave `--feature_indices` empty to auto-select the top
-`--n_features` (default 10) features.
+`--n_features` (default 10) features. `--filter_sequence` visualizes one exact
+protein (case-insensitive, `strip+upper`); the shard is auto-corrected and the
+embeddings fallback `source-nested → flat` (`Outputs/<exp>/embeddings/...`) is handled automatically.
 
 ---
 
@@ -397,11 +408,14 @@ python crossplm.py single visualize_features \
 
 ```
 Outputs/
+├── _pretrained/<hub-slug>/            # ONE central M0 per backbone (e.g. facebook--esm2_t6_8M_UR50D)
+│   ├── config.json / model.safetensors / tokenizer_config.json / vocab.txt
+│   └── m0_provenance.json
 └── <experiment>/
-    ├── config.yaml                                # Training config
+    ├── config.yaml / config_snapshot.yaml / provenance.json  # Training
     ├── training_curve.png                         # Training curve
     ├── eval_metrics.jsonl                         # Training eval history
-    ├── checkpoints/                               # Trained PLM checkpoints
+    ├── checkpoints/                               # Trained PLM checkpoints (MA/MB)
     │   ├── epoch_<N>_f1_<F>/                      # Best-3 by F1 (auto-pruned)
     │   ├── best/                                  # Stable alias: highest-F1
     │   ├── final/                                 # Final checkpoint
@@ -418,20 +432,22 @@ Outputs/
         │   ├── shard_<i>/residues.csv             # Residue metadata
         │   └── concept_columns.txt
         └── analysis/
-            ├── feature_label_metrics.json         # Task-label alignment
+            ├── feature_label_metrics.json         # Task-label alignment (ft only; M0 uses L0+L1)
             ├── feature_label_correlations.npy     # Point-biserial r per feature
             ├── feature_label_correlation_stats.json # r, p-value, BH q-value/FDR
             ├── activation_profile.npz             # Per-class mean/max activation
             ├── max_activations_per_feature.pt     # Used to build model_normalized.pt
-            ├── feature_concept_pairs.csv          # Feature × concept alignment
+            ├── feature_concept_pairs.csv          # Feature × concept alignment (M0 L1)
             ├── heldout_*.csv                      # Held-out validation
-            ├── fidelity_results.json              # Fidelity
-            ├── intervention_feat<N>_<mode>.json   # Causal intervention
+            ├── fidelity_results.json              # Fidelity (ft only, final layer currently)
+            ├── intervention_feat<N>_<mode>.json   # Causal intervention (ft only)
             ├── sequence_analysis.json             # Pooled Cohen's d + motif
             ├── sequence_logo_feature<N>.png       # Positional motif logo
             ├── coactivation_<a>_<b>.json          # Pooled pairwise co-activation
             └── visualizations/                    # PNG plots
 ```
+
+M0 is evaluated by `L0` (recon/`L0`/`dead%` from `train_sae`) + `L1` (concept alignment), not by task-label fidelity.
 
 ---
 

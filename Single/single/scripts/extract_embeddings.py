@@ -32,6 +32,50 @@ from tqdm import tqdm
 from single.embedders.ft_esm import FineTunedESMEmbedder
 
 
+def _slug_for_hub_id(hub_id: str) -> str:
+    """Sanitise a Hub ID (e.g. ``facebook/esm2_t6_8M_UR50D``) for a filesystem path."""
+    return hub_id.replace("/", "--").replace(":", "--")
+
+
+def _ensure_pretrained_dir(hub_id: str) -> Path:
+    """Return a local ``Outputs/_pretrained/<slug>`` directory for a Hub ID.
+
+    The directory is the single on-disk copy of the raw ``M0`` weights so that
+    ``MA`` and ``MB`` (which share the same backbone) do not materialise two
+    independent ``M0`` checkpoints.  If the directory does not yet exist the
+    model and tokenizer are fetched from the Hub once and saved there.
+    """
+    repo_root = Path(__file__).resolve().parents[3]
+    # Prefer the repo-root Outputs/_pretrained so every experiment shares it
+    target = repo_root / "Outputs" / "_pretrained" / _slug_for_hub_id(hub_id)
+    if target.exists() and (target / "config.json").exists():
+        return target
+    # Fallback: allow a Hub ID to be used directly without persisting, but when
+    # persisting prefer the central location.
+    print(f"[M0] Ensuring central pretrained cache at {target} for {hub_id} ...")
+    target.mkdir(parents=True, exist_ok=True)
+    # Lazy import so the fetch only happens for base M0
+    from transformers import AutoModel, AutoTokenizer
+
+    # Tokenizer first (cheap)
+    tok = AutoTokenizer.from_pretrained(hub_id, trust_remote_code=True)
+    tok.save_pretrained(str(target))
+    # Encoder only is sufficient for SAE0; AutoModel is the minimal artefact
+    try:
+        mdl = AutoModel.from_pretrained(hub_id, trust_remote_code=True)
+    except Exception:
+        from transformers import AutoModelForMaskedLM
+
+        mdl = AutoModelForMaskedLM.from_pretrained(hub_id, trust_remote_code=True)
+    mdl.save_pretrained(str(target))
+    # Minimal provenance for the central copy
+    (target / "m0_provenance.json").write_text(
+        json.dumps({"hub_id": hub_id, "slug": _slug_for_hub_id(hub_id)}, indent=2)
+    )
+    print(f"[M0] Saved central pretrained checkpoint to {target}")
+    return target
+
+
 def extract_embeddings(
     ckpt_path: Path,
     sequences_csv: Path,
@@ -49,6 +93,7 @@ def extract_embeddings(
     min_seq_len: int = 0,
     max_seq_len: int = 10_000,
     max_sequences: Optional[int] = None,
+    model_type: str = "ft",
 ):
     from single.paths import resolve_experiment
 
@@ -68,13 +113,32 @@ def extract_embeddings(
         label_map_spec, sequence_column, label_column
     )
 
+    # --model_type base: allow a Hub ID (e.g. facebook/esm2_t6_8M_UR50D) and
+    # ensure the central Outputs/_pretrained/<slug> single-copy is used so that
+    # MA and MB (same backbone) do not materialise two M0 directories.
+    resolved_ckpt = ckpt_path
+    if str(model_type).lower() == "base":
+        # Hub ID (no local dir) → centralise; local path → use as-is
+        ckpt_str = str(ckpt_path)
+        if not Path(ckpt_str).exists():
+            # Heuristic: Hub IDs contain a "/" and are not a local file
+            if "/" in ckpt_str:
+                resolved_ckpt = _ensure_pretrained_dir(ckpt_str)
+            else:
+                # Might be a local _pretrained/<slug> already
+                pass
+        print(f"[Model type] base (M0) — encoder-only, hub={ckpt_path} → resolved={resolved_ckpt}")
+    else:
+        print(f"[Model type] ft (fine-tuned) — token-classification head, ckpt={ckpt_path}")
+
     embedder = FineTunedESMEmbedder(
-        ckpt_path=ckpt_path,
+        ckpt_path=resolved_ckpt,
         max_length=max_length,
+        model_type=model_type,
     )
     print(f"Embedder ready: {embedder.embedding_dim}D, {embedder.n_layers} layers")
     print(f"Extracting layer {layer} (0-indexed, total {embedder.n_layers} layers)")
-    print(f"Label map: {label_map}")
+    print(f"Label map: {label_map}  model_type: {model_type}")
 
     # Shared loader: auto-detect separator, optional length filter (must MATCH
     # build_concept_matrix's filter so embedding/concept shards contain the SAME
@@ -83,17 +147,26 @@ def extract_embeddings(
         load_sequences_df,
         shuffled_shards,
         sequence_hash,
+        drop_mismatched_lengths,
         validate_sequence_label_lengths,
     )
     df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
                            min_seq_len=min_seq_len, max_seq_len=max_seq_len,
                            max_sequences=max_sequences)
+    n_before = len(df)
     sequences = df[sequence_column].tolist()
     print(f"Loaded {len(sequences)} sequences")
 
     has_labels = label_column is not None and label_column in df.columns
+    n_dropped_mismatched = 0
     if has_labels:
         df[label_column] = df[label_column].fillna("").astype(str)
+        df, n_dropped_mismatched = drop_mismatched_lengths(df, sequence_column, label_column)
+        if n_dropped_mismatched:
+            print(f"[Filter] Dropped {n_dropped_mismatched} row(s) with sequence/label length mismatches "
+                  f"(kept {len(df)}/{n_before}, matches Training's silent drop).")
+            sequences = df[sequence_column].tolist()
+        # Any remaining mismatch is a bug in drop logic; keep the strict check as a safety net
         validate_sequence_label_lengths(df, sequence_column, label_column)
 
     metadata = {
@@ -106,6 +179,8 @@ def extract_embeddings(
         "n_shards": n_shards,
         "shuffle_seed": 42,
         "residues_per_sequence": None,
+        "n_loaded": int(n_before),
+        "n_dropped_mismatched": int(n_dropped_mismatched),
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
@@ -180,8 +255,10 @@ def extract_embeddings(
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Extract hidden states from fine-tuned ESM2-8M")
-    parser.add_argument("--ckpt_path", type=Path, required=True, help="Path to fine-tuned model checkpoint")
+    parser = argparse.ArgumentParser(description="Extract hidden states from ESM (fine-tuned or base M0)")
+    parser.add_argument("--ckpt_path", type=str, required=True,
+                        help="Path to model checkpoint (local dir, e.g. Outputs/exp/checkpoints/best) "
+                             "or Hub ID for base M0 (e.g. facebook/esm2_t6_8M_UR50D / Synthyra/ESM2-8M)")
     parser.add_argument("--sequences_csv", type=Path, required=True, help="CSV with sequences and labels")
     parser.add_argument("--source", type=str, default=None,
                         help="Data-source id; nests outputs under Outputs/<experiment>/<source> (default: flat)")
@@ -205,8 +282,14 @@ def main(argv=None):
                         help="Deterministic subset; must match extract_embeddings --max_sequences")
     parser.add_argument("--max_seq_len", type=int, default=10000,
                         help="Drop sequences longer than this (must match concept build)")
+    parser.add_argument("--model_type", type=str, default="ft", choices=["ft", "base"],
+                        help="ft = fine-tuned token-classification checkpoint (MA/MB); "
+                             "base = pre-trained encoder-only M0 (Hub ID, no head)")
     args = parser.parse_args(argv)
-    extract_embeddings(**vars(args))
+    # argparse gives ckpt_path as str for base Hub IDs; keep that type for hub handling
+    kwargs = vars(args)
+    # Keep ckpt_path as str when it is a Hub ID so _ensure_pretrained_dir can run
+    extract_embeddings(**kwargs)
 
 
 if __name__ == "__main__":

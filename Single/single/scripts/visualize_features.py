@@ -156,6 +156,7 @@ def visualize_features(
     min_seq_len: int = 0,
     max_seq_len: int = 10_000,
     max_sequences: Optional[int] = None,
+    filter_sequence: Optional[str] = None,
 ):
     from single.paths import resolve_experiment
 
@@ -181,9 +182,20 @@ def visualize_features(
 
     # Infer embeddings path from experiment if not given:
     # Outputs/<exp>/embeddings/layer_<N>/shard_<S>/embeddings.pt
+    # Fallback: if source-nested path doesn't exist but flat does, use flat
+    # (common when task embeddings were extracted flat but analysis runs with --source)
     if embeddings_path is None:
         emb_dir = exp.embeddings_dir(layer=layer) / f"shard_{shard}"
         embeddings_path = emb_dir / "embeddings.pt"
+        if not embeddings_path.exists() and source:
+            from pathlib import Path as _Path
+            # Try flat location: Outputs/<exp>/embeddings/layer_<N>/shard_<S>/embeddings.pt
+            flat_exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=None) if (experiment or exp_dir) else None
+            if flat_exp is not None:
+                flat_path = flat_exp.embeddings_dir(layer=layer) / f"shard_{shard}" / "embeddings.pt"
+                if flat_path.exists():
+                    print(f"[Fallback] source-nested {embeddings_path} not found, using flat {flat_path}")
+                    embeddings_path = flat_path
         print(f"Inferred embeddings path: {embeddings_path}")
     embeddings_path = Path(embeddings_path)
 
@@ -227,25 +239,116 @@ def visualize_features(
         n_shards = len(list(exp.embeddings_dir(layer=layer).glob("shard_*"))) if exp else 1
         max_residues = max_length - 2
 
+        filt = None
+        if filter_sequence is not None:
+            filt = str(filter_sequence).strip().upper()
+            if not filt:
+                raise ValueError("--filter_sequence requires a non-empty sequence string")
+
         # Shared shuffle+shard (fixed seed) — identical to extract_embeddings.
         if n_shards > 1:
             shards = shuffled_shards(df, n_shards)
-            shard_df = shards[shard] if shard < len(shards) else df.iloc[:0]
+            if filt is not None:
+                # Search all shards for the exact sequence; keep original sharding
+                # so token offsets remain aligned with the stored embeddings.
+                found_shard = None
+                found_idx_in_shard = None
+                for sid, sdf in enumerate(shards):
+                    mask = sdf[sequence_column].astype(str).str.strip().str.upper() == filt
+                    if mask.any():
+                        found_shard = sid
+                        found_idx_in_shard = int(np.where(mask)[0][0])
+                        break
+                if found_shard is None:
+                    raise ValueError(
+                        f"No protein with the given sequence found in {sequences_csv} "
+                        f"(normalized length {len(filt)}). Check whitespace/case."
+                    )
+                if found_shard != shard:
+                    print(f"[Filter] sequence found in shard {found_shard}, overriding --shard {shard} → {found_shard}")
+                    shard = found_shard
+                    # Reload embeddings from the correct shard
+                    new_emb_dir = exp.embeddings_dir(layer=layer) / f"shard_{shard}"
+                    new_path = new_emb_dir / "embeddings.pt"
+                    if not new_path.exists() and source:
+                        flat_exp = resolve_experiment(exp_dir=exp_dir, name=experiment, source=None) if (experiment or exp_dir) else None
+                        if flat_exp is not None:
+                            flat_path = flat_exp.embeddings_dir(layer=layer) / f"shard_{shard}" / "embeddings.pt"
+                            if flat_path.exists():
+                                new_path = flat_path
+                    print(f"[Filter] reloading embeddings from {new_path}")
+                    data = torch.load(new_path, map_location=device, weights_only=True)
+                    if isinstance(data, dict):
+                        embeddings = data["embeddings"].to(device)
+                        labels = data.get("labels")
+                        if labels is not None:
+                            labels = labels.to(device)
+                    else:
+                        embeddings = data.to(device)
+                        labels = None
+                    print(f"  Reloaded embeddings shard_{shard}: {embeddings.shape}")
+                # Keep the full shard for offset calculation, but isolate the matched row for boundaries
+                full_shard_df = shards[shard]
+                # Compute token offset of the matched protein within its shard
+                # (sum of truncated lengths of preceding proteins in that shard)
+                offset = 0
+                for idx, seq in enumerate(full_shard_df[sequence_column].astype(str).tolist()):
+                    if idx == found_idx_in_shard:
+                        break
+                    offset += min(len(str(seq)), max_residues)
+                shard_df = full_shard_df.iloc[[found_idx_in_shard]].reset_index(drop=True)
+                # For filtered case, boundaries must start at the true offset within the shard's embedding tensor
+                seq_labels = None
+                if label_column and label_column in shard_df.columns:
+                    shard_df[label_column] = shard_df[label_column].fillna("").astype(str)
+                    seq_labels = shard_df[label_column].tolist()
+                seq = shard_df[sequence_column].iloc[0]
+                seq_len = min(len(str(seq)), max_residues)
+                boundaries.append((offset, offset + seq_len, str(seq), seq_labels[0] if seq_labels else None))
+            else:
+                shard_df = shards[shard] if shard < len(shards) else df.iloc[:0]
+                seq_labels = None
+                if label_column and label_column in shard_df.columns:
+                    shard_df[label_column] = shard_df[label_column].fillna("").astype(str)
+                    seq_labels = shard_df[label_column].tolist()
+                start = 0
+                for i, seq in enumerate(shard_df[sequence_column].tolist()[:max_proteins]):
+                    seq_len = min(len(str(seq)), max_residues)
+                    end = start + seq_len
+                    lbl = seq_labels[i] if seq_labels is not None else None
+                    boundaries.append((start, end, str(seq), lbl))
+                    start = end
         else:
             shard_df = df
-
-        seq_labels = None
-        if label_column and label_column in shard_df.columns:
-            shard_df[label_column] = shard_df[label_column].fillna("").astype(str)
-            seq_labels = shard_df[label_column].tolist()
-
-        start = 0
-        for i, seq in enumerate(shard_df[sequence_column].tolist()[:max_proteins]):
-            seq_len = min(len(str(seq)), max_residues)
-            end = start + seq_len
-            lbl = seq_labels[i] if seq_labels is not None else None
-            boundaries.append((start, end, str(seq), lbl))
-            start = end
+            if filt is not None:
+                mask = shard_df[sequence_column].astype(str).str.strip().str.upper() == filt
+                if not mask.any():
+                    raise ValueError(f"Filtered sequence not in shard {shard}")
+                # Single-shard case with filter: find offset similarly
+                found_idx = int(np.where(mask)[0][0])
+                offset = 0
+                for idx, seq in enumerate(shard_df[sequence_column].astype(str).tolist()):
+                    if idx == found_idx:
+                        break
+                    offset += min(len(str(seq)), max_residues)
+                seq = shard_df[sequence_column].iloc[found_idx]
+                lbl = shard_df[label_column].iloc[found_idx] if label_column and label_column in shard_df.columns else None
+                if lbl is not None:
+                    lbl = str(lbl)
+                seq_len = min(len(str(seq)), max_residues)
+                boundaries.append((offset, offset + seq_len, str(seq), lbl))
+            else:
+                seq_labels = None
+                if label_column and label_column in shard_df.columns:
+                    shard_df[label_column] = shard_df[label_column].fillna("").astype(str)
+                    seq_labels = shard_df[label_column].tolist()
+                start = 0
+                for i, seq in enumerate(shard_df[sequence_column].tolist()[:max_proteins]):
+                    seq_len = min(len(str(seq)), max_residues)
+                    end = start + seq_len
+                    lbl = seq_labels[i] if seq_labels is not None else None
+                    boundaries.append((start, end, str(seq), lbl))
+                    start = end
     else:
         sequences = ["M" * embeddings.shape[0]]
         boundaries = [(0, min(200, embeddings.shape[0]), sequences[0], None)]
@@ -314,6 +417,10 @@ def main(argv=None):
     parser.add_argument("--label_column", type=str, default=None)
     parser.add_argument("--feature_indices", type=int, nargs="+", default=None)
     parser.add_argument("--n_features", type=int, default=10)
+    parser.add_argument("--filter_sequence", type=str, default=None,
+                        help="Exact protein sequence to visualize (single sequence, case-insensitive, whitespace trimmed). "
+                             "When given, only that protein is visualized and --shard is auto-corrected to its shard. "
+                             "Requires --sequences_csv.")
     parser.add_argument("--label_map", type=str, default="mBMRB",
                         help="Label encoding preset name or path to YAML label-map file")
     args = parser.parse_args(argv)

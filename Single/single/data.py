@@ -72,6 +72,28 @@ def validate_sequence_label_lengths(
         )
 
 
+def drop_mismatched_lengths(
+    df: pd.DataFrame, sequence_column: str, label_column: str
+) -> tuple[pd.DataFrame, int]:
+    """Drop rows where sequence/label lengths differ (to match Training).
+
+    Returns the filtered DataFrame and the number of dropped rows.
+    ``Training`` via ``single.label_maps.load_labeled_sequences`` compares
+    ``len(seq.strip().upper())`` vs ``len(lbl.strip())`` (so a trailing space
+    counts as a mismatch); ``Single`` now mirrors that exactly.
+    """
+    if label_column not in df.columns:
+        return df, 0
+    # Mirror Training: strip (and upper for sequences) before comparing
+    seq_lens = df[sequence_column].astype(str).str.strip().str.upper().str.len()
+    lbl_lens = df[label_column].fillna("").astype(str).str.strip().str.len()
+    mask = seq_lens == lbl_lens
+    n_dropped = int((~mask).sum())
+    if n_dropped:
+        df = df.loc[mask].reset_index(drop=True)
+    return df, n_dropped
+
+
 def sequence_hash(sequence: str) -> str:
     """Stable identity for a normalized protein sequence."""
     normalized = str(sequence).strip().upper()
@@ -163,6 +185,8 @@ def build_residue_positions(
     n_shards: int = 5,
     max_residues: int = 510,
     sequence_column: str = "sequence",
+    label_column: Optional[str] = None,
+    label_map: Optional[str] = None,
     min_seq_len: int = 0,
     max_seq_len: int = 10_000,
     max_sequences: Optional[int] = None,
@@ -175,6 +199,9 @@ def build_residue_positions(
 
     IMPORTANT: min_seq_len/max_seq_len/max_sequences MUST match whatever filter
     was used at extraction, or the protein/residue mapping silently misaligns.
+    When a label column is present, rows with sequence/label length mismatches
+    are dropped to mirror ``extract_embeddings`` / ``Training`` (``9786→9554`` for
+    mBMRB), so the rebuilt shards stay aligned with the stored ``residues.csv``.
 
     Returns:
         shards: list of shard DataFrames (index by shard id), so callers can
@@ -185,6 +212,11 @@ def build_residue_positions(
     df = load_sequences_df(sequences_csv, sequence_column=sequence_column,
                            min_seq_len=min_seq_len, max_seq_len=max_seq_len,
                            max_sequences=max_sequences)
+    # Mirror extract_embeddings: drop rows where len(seq) != len(label) when a
+    # label column exists, so the shuffled shards are identical.
+    if label_column and label_column in df.columns:
+        df[label_column] = df[label_column].fillna("").astype(str)
+        df, _ = drop_mismatched_lengths(df, sequence_column, label_column)
     shards = shuffled_shards(df, n_shards)
 
     shard_proteins: Dict[int, List[int]] = {}
